@@ -1,0 +1,4 @@
+interface:
+  display_name: "Galgame 日译中流水线"
+  short_description: "作品研究、场景日译中、独立审校、封包与实机 QA"
+  default_prompt: "使用 $translate-galgame-zh 对这个 Galgame 建立可恢复的完整汉化流水线。"
