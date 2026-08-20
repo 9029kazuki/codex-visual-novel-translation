@@ -4,14 +4,14 @@
 
 English · [简体中文](README.zh-CN.md)
 
-This repository contains installable Codex skills rather than a runtime translator, OCR overlay, or one-click machine-translation application. The current public skill targets Japanese-to-Simplified-Chinese projects. A language-pair-configurable English edition is also maintained in this repository.
+This repository contains installable Codex skills rather than a runtime translator, OCR overlay, or one-click machine-translation application. It provides a specialized Japanese-to-Simplified-Chinese edition and an English, language-pair-configurable edition.
 
 ## Skills
 
 | Skill | Purpose | Status |
 | --- | --- | --- |
 | [`translate-galgame-zh`](skills/translate-galgame-zh) | Japanese visual novel → Simplified Chinese | Available |
-| `translate-visual-novel` | Configurable source and target languages, English instructions | In development |
+| [`translate-visual-novel`](skills/translate-visual-novel) | Configurable source and target languages, English instructions | Available |
 
 ## What the workflow covers
 
@@ -40,6 +40,14 @@ Copy-Item -Recurse -Force `
 
 Restart Codex if the skill does not appear immediately.
 
+For the English multilingual edition, copy `skills/translate-visual-novel` instead:
+
+```powershell
+Copy-Item -Recurse -Force `
+  .\codex-visual-novel-translation\skills\translate-visual-novel `
+  "$env:USERPROFILE\.codex\skills\translate-visual-novel"
+```
+
 ## Use
 
 Invoke the Chinese translation workflow explicitly:
@@ -54,9 +62,16 @@ Or ask naturally in Chinese:
 使用 $translate-galgame-zh 汉化这个 Galgame。先研究准确版本的解包与封包方法，再建立术语、人设和角色口吻，按完整场景翻译、独立审校、回填并实机验证。
 ```
 
+For another language pair:
+
+```text
+Use $translate-visual-novel to translate this Japanese visual novel into Spanish. Preserve engine controls, research established Spanish names and terminology, and build a recoverable localization project.
+```
+
 ## Current scope
 
 - The complete workflow has been exercised on a commercial-scale Windows KiriKiri/XP3 project.
+- The multilingual edition accepts explicit BCP 47-style source and target locales and generates a frozen language-pair profile for each project.
 - Engine-specific extraction and repacking still require exact-version research and an independently proven round trip.
 - GARbro is optional and is not redistributed in this repository. Use your own installation when it is appropriate for the target game.
 - The skill does not include game files, scripts, translations, fonts, or patches from any commercial title.

@@ -4,14 +4,14 @@
 
 [English](README.md) · 简体中文
 
-本仓库提供可安装的 Codex Skill，不是实时翻译器、OCR 覆盖层或一键机翻软件。当前已公开版本用于日语视觉小说到简体中文的完整汉化；仓库还会维护采用英文说明、可配置源语言和目标语言的国际版。
+本仓库提供可安装的 Codex Skill，不是实时翻译器、OCR 覆盖层或一键机翻软件。仓库同时提供日语视觉小说到简体中文的专用版，以及采用英文说明、可配置源语言和目标语言的国际版。
 
 ## Skill
 
 | Skill | 用途 | 状态 |
 | --- | --- | --- |
 | [`translate-galgame-zh`](skills/translate-galgame-zh) | 日语视觉小说 → 简体中文 | 已发布 |
-| `translate-visual-novel` | 英文说明，可配置语言对 | 开发中 |
+| [`translate-visual-novel`](skills/translate-visual-novel) | 英文说明，可配置语言对 | 已发布 |
 
 ## 主要能力
 
@@ -36,6 +36,8 @@ Copy-Item -Recurse -Force `
 
 如果 Skill 没有立即出现，请重启 Codex。
 
+安装英文多语言版时，将上面命令中的两个 `translate-galgame-zh` 都替换为 `translate-visual-novel`。
+
 ## 使用
 
 ```text
@@ -44,9 +46,16 @@ Copy-Item -Recurse -Force `
 
 也可以直接提供游戏目录，并说明补丁形式、是否允许启动游戏及其他限制。
 
+国际版调用示例：
+
+```text
+Use $translate-visual-novel to translate this Japanese visual novel into Spanish. Preserve engine controls, research established Spanish names and terminology, and build a recoverable localization project.
+```
+
 ## 当前范围
 
 - 完整流程已经在一个商业规模的 Windows KiriKiri/XP3 项目中实际执行。
+- 国际版要求显式填写 BCP 47 风格的源语言和目标语言，并为每个工程生成冻结的语言对配置。
 - 具体引擎的解包与封包仍必须针对准确版本研究，并单独证明无翻译往返可行。
 - 本仓库不分发 GARbro；如目标游戏适用，请使用用户自行安装的版本。
 - 本仓库不包含任何商业游戏的文件、脚本、译文、字体或补丁。

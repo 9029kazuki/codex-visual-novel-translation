@@ -1,0 +1,4 @@
+interface:
+  display_name: "Visual Novel Translation"
+  short_description: "Research, translate, review, repack, and playtest visual novels"
+  default_prompt: "Use $translate-visual-novel to translate this visual novel for my requested target locale with a recoverable end-to-end workflow."
