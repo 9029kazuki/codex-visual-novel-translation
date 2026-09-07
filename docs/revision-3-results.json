@@ -1,0 +1,86 @@
+{
+  "skill": "translate-galgame-zh",
+  "revision": 3,
+  "measurement_source": "local localize-galgame revision 3 prior to public-name and GARbro packaging adaptation",
+  "regression_tests": 24,
+  "regression_passed": true,
+  "schema_valid": true,
+  "entrypoint_tokens": {
+    "method": "o200k_base proxy, not host usage",
+    "before": 2068,
+    "after": 1609
+  },
+  "matched_benchmark": {
+    "before_seconds": 3.061716099999103,
+    "synthetic_only": true,
+    "comparison": "same source and selected job rows as the original audit benchmark; new verification and budget policy retained",
+    "source_records": 20000,
+    "planned_jobs": 100,
+    "built_jobs": 10,
+    "built_records": 2000,
+    "candidate_seconds": 1.7574668999995993,
+    "candidate_chunks": 50,
+    "input_snapshot": {
+      "physical_reads": 54,
+      "file_cache_misses": 27,
+      "verification_reads": 27,
+      "parsed_jsonl_records": 20104
+    },
+    "observed_local_time_reduction_percent": 42.59863283861903
+  },
+  "whole_source_benchmark": {
+    "synthetic_only": true,
+    "source_rows": 20000,
+    "jobs": 10,
+    "candidate_build_seconds": 8.585047999999915,
+    "input_snapshot": {
+      "physical_reads": 54,
+      "file_cache_misses": 27,
+      "verification_reads": 27,
+      "parsed_jsonl_records": 20014
+    },
+    "candidate_job_chunks": 340,
+    "short_line_test": {
+      "rows": 20000,
+      "chars": 40000,
+      "chunks": 164,
+      "max_planning_input": 10452,
+      "max_planning_output": 8174,
+      "method": "utf8-bytes:conservative-planning-estimate",
+      "coverage_valid": true
+    },
+    "actual_model_cache_rate": null
+  },
+  "visualization": {
+    "checkedStates": 40,
+    "errors": [],
+    "failures": []
+  },
+  "independent_forward_review": {
+    "source_rows": 9,
+    "reviewed_rows": 9,
+    "changed_rows": 2,
+    "merged_rows": 9,
+    "qa_errors": 0,
+    "qa_warnings": 0,
+    "synthetic_only": true
+  },
+  "targeted_dependency_demo": {
+    "schema_version": 1,
+    "reusable": [
+      "job-0000",
+      "job-0001"
+    ],
+    "needs_attention": [
+      {
+        "job_id": "job-0002",
+        "issues": [
+          "job job-0002: semantic dependencies changed; targeted review/rebuild required"
+        ]
+      }
+    ],
+    "mutated_jobs": false
+  },
+  "actual_model_usage": null,
+  "actual_cache_hit_rate": null
+}

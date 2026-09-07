@@ -1,64 +1,25 @@
 #!/usr/bin/env python3
-"""Build a deterministic job bundle with a slim model view and chunk plan."""
-
+"""Build immutable, budgeted job snapshots; --jobs/--all-pending shares one read snapshot."""
 from __future__ import annotations
 
 import argparse
-import csv
+import copy
 import hashlib
 import json
 import sys
-from collections import Counter
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
 from audit_project import validate_project
+from pipeline_common import (REVISION, TokenCounter, atomic_text, digest_text, digest_value,
+    inside, json_text, load_prefix, load_semantics, read_json, read_jsonl, read_snapshot,
+    read_text, scoped_semantics, job_contract_digest)
 
-
-SKILL_REVISION = 2
-BUNDLE_SCHEMA = 2
 MODEL_FIELDS = ("id", "kind", "speaker", "text", "protected_tokens")
 
 
-def read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    if not path.exists():
-        return records
-    with path.open("r", encoding="utf-8-sig") as stream:
-        for line_number, raw in enumerate(stream, 1):
-            if not raw.strip():
-                continue
-            try:
-                item = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
-            if not isinstance(item, dict):
-                raise ValueError(f"{path}:{line_number}: expected an object")
-            records.append(item)
-    return records
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-
-
-def jsonl_text(records: list[dict[str, Any]]) -> str:
-    return "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records)
-
-
-def sha256_text(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def source_digest(records: list[dict[str, Any]]) -> str:
+def source_digest(records):
     digest = hashlib.sha256()
     for record in records:
         digest.update(str(record.get("id") or "").encode("utf-8"))
@@ -68,616 +29,236 @@ def source_digest(records: list[dict[str, Any]]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def project_relative(project: Path, path: Path) -> str:
+def model_record(record):
+    value = {"id": record["id"], "kind": record.get("kind", record.get("type", "")),
+             "speaker": record.get("speaker", ""), "text": record["text"]}
+    if record.get("protected_tokens"):
+        value["protected_tokens"] = record["protected_tokens"]
+    return value
+
+
+def jsonl_text(rows):
+    return "".join(json_text(row) for row in rows)
+
+
+def project_relative(project, path):
     try:
         return path.resolve().relative_to(project.resolve()).as_posix()
     except ValueError:
         return str(path.resolve())
 
 
-def model_record(record: dict[str, Any]) -> dict[str, Any]:
-    tokens = record.get("protected_tokens")
-    if not isinstance(tokens, list):
-        tokens = []
-    return {
-        "id": str(record.get("id") or ""),
-        "kind": str(record.get("kind") or record.get("type") or ""),
-        "speaker": str(record.get("speaker") or ""),
-        "text": str(record.get("text") or ""),
-        "protected_tokens": [str(token) for token in tokens],
-    }
+def packet(context, primary, before, after, adjacent, chunk_id):
+    return {"chunk_id": chunk_id, "context": context, "primary": [model_record(x) for x in primary],
+            "overlap_before": [model_record(x) for x in before], "overlap_after": [model_record(x) for x in after],
+            "adjacent": [model_record(x) for x in adjacent]}
 
 
-def machine_record(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": record.get("id"),
-        "source_hash": record.get("source_hash"),
-        "file": record.get("file"),
-        "order": record.get("order"),
-        "route": record.get("route"),
-        "scene_id": record.get("scene_id"),
-    }
-
-
-def character_names(character: dict[str, Any]) -> set[str]:
-    values: set[str] = set()
-    for key in ("id", "name", "jp_name", "source_name", "zh_name", "target_name"):
-        value = character.get(key)
-        if isinstance(value, str) and value:
-            values.add(value)
-    aliases = character.get("aliases", [])
-    if isinstance(aliases, list):
-        values.update(str(value) for value in aliases if value)
-    return values
-
-
-def select_characters(payload: Any, speakers: set[str], scene_text: str) -> list[Any]:
-    items = payload.get("characters", []) if isinstance(payload, dict) else payload
-    if not isinstance(items, list):
-        return []
-    selected: list[Any] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        names = character_names(item)
-        if names & speakers or any(name and name in scene_text for name in names):
-            selected.append(item)
-    return selected
-
-
-def select_voice(payload: Any, speakers: set[str], characters: list[Any]) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-    result: dict[str, Any] = {}
-    if "narrator" in payload:
-        result["narrator"] = payload["narrator"]
-    voices = payload.get("characters", {})
-    if not isinstance(voices, dict):
-        return result
-    names = set(speakers)
-    for character in characters:
-        if isinstance(character, dict):
-            names.update(character_names(character))
-    result["characters"] = {
-        key: value for key, value in voices.items() if str(key) in names
-    }
-    return result
-
-
-def read_glossary(path: Path, scene_text: str, speakers: set[str]) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    selected: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream, delimiter="\t")
-        for row in reader:
-            source = (row.get("source") or "").strip()
-            target = (row.get("target") or "").strip()
-            if source and (source in scene_text or source in speakers or target in speakers):
-                selected.append(dict(row))
-    return selected
-
-
-def select_route_knowledge(payload: Any, route: str) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-    routes = payload.get("routes", {})
-    return {
-        "global": payload.get("global", {}),
-        "route": routes.get(route, {}) if isinstance(routes, dict) else {},
-    }
-
-
-def select_calibration(
-    path: Path, speakers: set[str], glossary: list[dict[str, str]], limit: int = 50
-) -> list[dict[str, Any]]:
-    terms = {row.get("source", "") for row in glossary if row.get("source")}
-    selected: list[dict[str, Any]] = []
-    for item in read_jsonl(path):
-        source = str(item.get("source") or item.get("text") or "")
-        speaker = str(item.get("speaker") or "")
-        if speaker in speakers or any(term in source for term in terms):
-            selected.append(item)
-            if len(selected) >= limit:
+def build_chunk_artifacts(scene, target_chars=45000, overlap_entries=8, *, counter=None,
+                          input_budget=32000, output_reserve=8192, prefix_tokens=0,
+                          fixed_overhead=0, context="", adjacent=None):
+    counter = counter or TokenCounter()
+    adjacent = adjacent or []
+    if not scene or overlap_entries < 0 or input_budget <= 0 or output_reserve <= 0:
+        raise ValueError("nonempty scene and positive budgets are required")
+    ids = [row["id"] for row in scene]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate source IDs")
+    empty_tokens = counter.count(json_text(packet(context, [], [], [], adjacent, "chunk-0000")))
+    room = input_budget - prefix_tokens - fixed_overhead - empty_tokens
+    if room <= 0:
+        raise ValueError(f"shared prefix/context exhausts input budget {input_budget}; choose an approved smaller profile or explicit larger budget")
+    in_sizes = [counter.count(json_text(model_record(row))) + 4 for row in scene]
+    out_sizes = [max(1, int(counter.count(json_text({"id": row["id"], "translation": row["text"]})) * 1.5)) for row in scene]
+    ranges, start, used, out, chars = [], 0, 0, 0, 0
+    for i, row in enumerate(scene):
+        size = len(row["text"])
+        overflow = used + in_sizes[i] > room or out + out_sizes[i] > output_reserve or (target_chars > 0 and chars + size > target_chars)
+        boundary = i > start and (row.get("boundary_before") or row.get("scene_id") != scene[i-1].get("scene_id"))
+        if i > start and (overflow or boundary):
+            ranges.append((start, i))
+            start, used, out, chars = i, 0, 0, 0
+        used += in_sizes[i]
+        out += out_sizes[i]
+        chars += size
+        if in_sizes[i] > room or out_sizes[i] > output_reserve:
+            raise ValueError(f"single entry {row['id']} exceeds planning budget; resolve the long entry explicitly")
+    ranges.append((start, len(scene)))
+    chunks, files = [], {}
+    for index, (left, right) in enumerate(ranges):
+        chunk_id = f"chunk-{index+1:04d}"
+        primary = scene[left:right]
+        before = scene[max(0, left-overlap_entries):left]
+        after = scene[right:right+overlap_entries]
+        original_overlap = len(before) + len(after)
+        while True:
+            value = packet(context, primary, before, after, adjacent, chunk_id)
+            input_tokens = prefix_tokens + fixed_overhead + counter.count(json_text(value))
+            if input_tokens <= input_budget:
                 break
-    return selected
-
-
-def json_block(value: Any) -> str:
-    return "```json\n" + json.dumps(value, ensure_ascii=False, indent=2) + "\n```"
-
-
-def resolve_shared_manifest(
-    project: Path, explicit: Path | None, standalone: bool
-) -> tuple[Path | None, dict[str, Any] | None]:
-    if standalone:
-        return None, None
-    manifest_path: Path | None = explicit.resolve() if explicit else None
-    if manifest_path is None:
-        pointer_path = project / "contexts/shared-prefix/current.json"
-        pointer = read_json(pointer_path, {})
-        if isinstance(pointer, dict) and pointer.get("manifest"):
-            candidate = Path(str(pointer["manifest"]))
-            manifest_path = candidate if candidate.is_absolute() else project / candidate
-    if manifest_path is None:
-        return None, None
-    if not manifest_path.is_file():
-        raise ValueError(f"shared prefix manifest does not exist: {manifest_path}")
-    manifest = read_json(manifest_path, None)
-    if not isinstance(manifest, dict):
-        raise ValueError(f"shared prefix manifest is invalid: {manifest_path}")
-    prefix_path = manifest_path.parent / "shared-prefix.md"
-    if not prefix_path.is_file():
-        raise ValueError(f"shared prefix text is missing: {prefix_path}")
-    actual_prefix_digest = sha256_text(prefix_path.read_text(encoding="utf-8-sig"))
-    if actual_prefix_digest != manifest.get("prefix_sha256"):
-        raise ValueError("shared prefix digest does not match its manifest")
-    for section in manifest.get("sections", []):
-        if not isinstance(section, dict) or not section.get("file"):
-            raise ValueError("shared prefix manifest contains an invalid section")
-        section_path = manifest_path.parent / str(section["file"])
-        if not section_path.is_file():
-            raise ValueError(f"shared prefix section is missing: {section_path}")
-        actual = sha256_text(section_path.read_text(encoding="utf-8-sig"))
-        if actual != section.get("sha256"):
-            raise ValueError(f"shared prefix section digest mismatch: {section_path}")
-    return manifest_path.resolve(), manifest
-
-
-def natural_units(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    units: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_scene: str | None = None
-    for record in records:
-        scene = str(record.get("scene_id") or record.get("file") or "")
-        boundary = bool(record.get("boundary_before"))
-        if current and (boundary or scene != current_scene):
-            units.append(current)
-            current = []
-        current_scene = scene
-        current.append(record)
-    if current:
-        units.append(current)
-    return units
-
-
-def split_oversized_unit(
-    unit: list[dict[str, Any]], target_chars: int
-) -> list[tuple[list[dict[str, Any]], bool]]:
-    if target_chars <= 0:
-        return [(unit, False)]
-    result: list[tuple[list[dict[str, Any]], bool]] = []
-    current: list[dict[str, Any]] = []
-    chars = 0
-    for record in unit:
-        length = len(str(record.get("text") or ""))
-        if current and chars + length > target_chars:
-            result.append((current, True))
-            current = []
-            chars = 0
-        current.append(record)
-        chars += length
-    if current:
-        result.append((current, len(result) > 0 or chars > target_chars))
-    return result
-
-
-def build_primary_chunks(
-    records: list[dict[str, Any]], target_chars: int
-) -> list[tuple[list[dict[str, Any]], bool]]:
-    if target_chars <= 0:
-        return [(records, False)]
-    pieces: list[tuple[list[dict[str, Any]], bool]] = []
-    for unit in natural_units(records):
-        if sum(len(str(item.get("text") or "")) for item in unit) > target_chars:
-            pieces.extend(split_oversized_unit(unit, target_chars))
-        else:
-            pieces.append((unit, False))
-
-    chunks: list[tuple[list[dict[str, Any]], bool]] = []
-    current: list[dict[str, Any]] = []
-    current_chars = 0
-    current_forced = False
-    for piece, forced in pieces:
-        piece_chars = sum(len(str(item.get("text") or "")) for item in piece)
-        if current and current_chars + piece_chars > target_chars:
-            chunks.append((current, current_forced))
-            current = []
-            current_chars = 0
-            current_forced = False
-        current.extend(piece)
-        current_chars += piece_chars
-        current_forced = current_forced or forced
-    if current:
-        chunks.append((current, current_forced))
-    return chunks
-
-
-def build_chunk_artifacts(
-    scene: list[dict[str, Any]], target_chars: int, overlap_entries: int
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
-    primary_chunks = build_primary_chunks(scene, target_chars)
-    model_by_id = {str(item.get("id")): model_record(item) for item in scene}
-    chunks: list[dict[str, Any]] = []
-    files: dict[str, str] = {}
-    all_primary_ids: list[str] = []
-    for index, (primary, forced) in enumerate(primary_chunks):
-        chunk_id = f"chunk-{index + 1:04d}"
-        primary_ids = [str(item.get("id")) for item in primary]
-        before_ids = (
-            [str(item.get("id")) for item in primary_chunks[index - 1][0]][-overlap_entries:]
-            if overlap_entries > 0 and index > 0
-            else []
-        )
-        after_ids = (
-            [str(item.get("id")) for item in primary_chunks[index + 1][0]][:overlap_entries]
-            if overlap_entries > 0 and index + 1 < len(primary_chunks)
-            else []
-        )
-        primary_file = f"chunks/{chunk_id}.source.model.jsonl"
-        before_file = f"chunks/{chunk_id}.overlap-before.model.jsonl"
-        after_file = f"chunks/{chunk_id}.overlap-after.model.jsonl"
-        files[primary_file] = jsonl_text([model_by_id[value] for value in primary_ids])
-        files[before_file] = jsonl_text([model_by_id[value] for value in before_ids])
-        files[after_file] = jsonl_text([model_by_id[value] for value in after_ids])
-        all_primary_ids.extend(primary_ids)
-        chunks.append(
-            {
-                "chunk_id": chunk_id,
-                "primary_entry_ids": primary_ids,
-                "overlap_before_ids": before_ids,
-                "overlap_after_ids": after_ids,
-                "primary_source": primary_file,
-                "overlap_before_source": before_file,
-                "overlap_after_source": after_file,
-                "primary_char_count": sum(
-                    len(str(item.get("text") or "")) for item in primary
-                ),
-                "forced_inside_natural_unit": forced,
-                "scene_ids": list(
-                    dict.fromkeys(
-                        str(item.get("scene_id") or item.get("file") or "")
-                        for item in primary
-                    )
-                ),
-            }
-        )
-
-    expected_ids = [str(item.get("id")) for item in scene]
-    counts = Counter(all_primary_ids)
-    duplicates = sorted(value for value, count in counts.items() if count != 1)
-    missing = [value for value in expected_ids if value not in counts]
-    extra = sorted(set(counts) - set(expected_ids))
-    coverage = {
-        "schema_version": 1,
-        "valid": not duplicates and not missing and not extra,
-        "planned_entry_count": len(expected_ids),
-        "covered_entry_count": len(counts),
-        "missing_ids": missing,
-        "duplicate_primary_ids": duplicates,
-        "extra_ids": extra,
-        "assignments": {
-            entry_id: chunk["chunk_id"]
-            for chunk in chunks
-            for entry_id in chunk["primary_entry_ids"]
-        },
-    }
-    plan = {
-        "schema_version": 1,
-        "target_chars": target_chars,
-        "overlap_entries": overlap_entries,
-        "chunk_count": len(chunks),
-        "chunks": chunks,
-    }
+            if before or after:
+                if len(before) >= len(after):
+                    before = before[1:]
+                else:
+                    after = after[:-1]
+            else:
+                raise ValueError(f"serialized packet {chunk_id} exceeds planning budget ({input_tokens}>{input_budget})")
+        primary_path = f"chunks/{chunk_id}.source.model.jsonl"
+        before_path = f"chunks/{chunk_id}.overlap-before.model.jsonl"
+        after_path = f"chunks/{chunk_id}.overlap-after.model.jsonl"
+        packet_path = f"chunks/{chunk_id}.packet.json"
+        files[primary_path] = jsonl_text([model_record(x) for x in primary])
+        files[before_path] = jsonl_text([model_record(x) for x in before])
+        files[after_path] = jsonl_text([model_record(x) for x in after])
+        files[packet_path] = json_text(value)
+        chunks.append({"chunk_id": chunk_id, "primary_entry_ids": [x["id"] for x in primary],
+            "overlap_before_ids": [x["id"] for x in before], "overlap_after_ids": [x["id"] for x in after],
+            "primary_source": primary_path, "overlap_before_source": before_path, "overlap_after_source": after_path,
+            "packet": packet_path, "estimated_input_tokens": input_tokens, "estimated_output_tokens": sum(out_sizes[left:right]),
+            "overlap_reduced_for_budget": len(before)+len(after) < original_overlap,
+            "forced_inside_natural_unit": bool(left and not scene[left].get("boundary_before") and scene[left].get("scene_id") == scene[left-1].get("scene_id")),
+            "primary_char_count": sum(len(x["text"]) for x in primary)})
+    coverage = {"schema_version": 2, "valid": True, "planned_entry_count": len(ids), "covered_entry_count": len(ids),
+                "missing_ids": [], "duplicate_primary_ids": [], "extra_ids": [],
+                "assignments": {entry: chunk["chunk_id"] for chunk in chunks for entry in chunk["primary_entry_ids"]}}
+    plan = {"schema_version": 2, "chunk_count": len(chunks), "target_chars": target_chars, "overlap_entries": overlap_entries,
+            "token_method": counter.method, "input_budget_tokens": input_budget, "output_reserve_tokens": output_reserve, "chunks": chunks}
     return plan, coverage, files
 
 
-def main() -> int:
+def resolve_manifest(project, explicit):
+    if explicit:
+        return explicit.resolve()
+    pointer = read_json(project / "contexts/shared-prefix/current.json")
+    path = Path(pointer["manifest"])
+    return path if path.is_absolute() else project / path
+
+
+def build_job(project, job, args, source_by_id, counter):
+    job_id = job["job_id"]
+    if job.get("plan_approved") is not True:
+        raise ValueError(f"job {job_id} is not approved")
+    scene = [source_by_id[x] for x in job["entry_ids"]]
+    if source_digest(scene) != job.get("source_digest"):
+        raise ValueError(f"job {job_id} source digest changed")
+    selected = set(job["entry_ids"])
+    adjacent = [source_by_id[x] for x in dict.fromkeys(job.get("adjacent_entry_ids", [])) if x not in selected]
+    manifest_path = resolve_manifest(project, args.shared_prefix_manifest)
+    manifest, frozen = load_prefix(manifest_path)
+    if frozen is None:
+        raise ValueError("rebuild the shared prefix with v3 before building jobs")
+    # The profile is an approved closure; a per-job subset may only narrow it
+    # when the coordinator has explicitly approved that subset.
+    scope = job.get("dependency_scope") or manifest.get("profile") or {"mode": "project"}
+    dependency = scoped_semantics(frozen, scope)
+    decisions_path = Path(manifest.get("live_decisions_source") or manifest["decision_snapshot"]["source"])
+    if not decisions_path.is_absolute():
+        decisions_path = project / decisions_path
+    current = load_semantics(project, Path(manifest["contract_source"]), decisions_path)
+    if digest_value(scoped_semantics(current, scope)) != digest_value(dependency):
+        raise ValueError(f"job {job_id} selected prefix is stale for its semantic dependencies")
+    if job.get("decision_snapshot_digest") and job["decision_snapshot_digest"] != manifest["decision_snapshot"]["sha256"]:
+        raise ValueError("job decision digest differs; explicitly migrate the legacy/raw decision binding")
+    context_data = {key: job.get(key, "") for key in ("job_id", "route", "scene_ids", "time", "location", "prior_summary", "context_notes", "predecessors")}
+    context_data.update({"primary_only": True, "draft_output": f"translations/drafts/{job_id}.jsonl",
+                         "review_output": f"reviews/{job_id}.jsonl", "shared_prefix_id": manifest["prefix_id"]})
+    context = json_text(context_data)
+    prefix_text = read_text(manifest_path.parent / "shared-prefix.md")
+    if args.standalone:
+        context += "\n" + prefix_text
+    prefix_tokens = 0 if args.standalone else counter.count(prefix_text)
+    effective_budget = args.input_budget_tokens
+    if args.context_window_tokens:
+        effective_budget = min(effective_budget, args.context_window_tokens - args.output_reserve_tokens)
+    plan, coverage, chunk_files = build_chunk_artifacts(scene, args.chunk_target_chars, args.chunk_overlap_entries,
+        counter=counter, input_budget=effective_budget, output_reserve=args.output_reserve_tokens,
+        prefix_tokens=prefix_tokens, fixed_overhead=args.fixed_overhead_tokens, context=context, adjacent=adjacent)
+    plan.update(job_id=job_id, source_digest=job["source_digest"])
+    coverage.update(job_id=job_id, source_digest=job["source_digest"])
+    machine = {"schema_version": 2, "job_id": job_id, "source_digest": job["source_digest"],
+               "records": [{key: row.get(key) for key in ("id", "source_hash", "file", "order", "route", "scene_id")} for row in scene]}
+    artifacts = {"context.md": context, "source.jsonl": jsonl_text(scene), "source.model.jsonl": jsonl_text([model_record(x) for x in scene]),
+                 "adjacent.jsonl": jsonl_text(adjacent), "adjacent.model.jsonl": jsonl_text([model_record(x) for x in adjacent]),
+                 "source-manifest.json": json_text(machine), "chunk-plan.json": json_text(plan), "coverage-plan.json": json_text(coverage), **chunk_files}
+    artifact_hashes = {key: digest_text(value) for key, value in artifacts.items()}
+    warnings = ["Counts are planning estimates; confirm host input/history and output limits before dispatch."]
+    if not args.context_window_tokens:
+        warnings.append("Host context capacity was not supplied; only the configured planning cap is checked.")
+    status = {"schema_version": 3, "skill_revision": REVISION, "valid": True, "job_id": job_id,
+        "source_digest": job["source_digest"], "bible_version": job.get("bible_version"),
+        "shared_prefix_id": manifest["prefix_id"], "shared_prefix_sha256": manifest["prefix_sha256"],
+        "shared_prefix_manifest": project_relative(project, manifest_path), "mode": "standalone" if args.standalone else "shared-prefix",
+        "dependency_scope": scope, "dependency_digest": digest_value(dependency), "entry_count": len(scene),
+        "job_contract_digest": job_contract_digest(job), "input_records_digest": digest_value({"scene": scene, "adjacent": adjacent}),
+        "adjacent_entry_count": len(adjacent), "chunk_count": plan["chunk_count"], "artifacts": artifact_hashes,
+        "budget": {"planning_passed": True, "host_capacity_supplied": bool(args.context_window_tokens),
+            "actual_usage_verified": False, "token_method": counter.method, "input_budget_tokens": effective_budget,
+            "output_reserve_tokens": args.output_reserve_tokens, "fixed_overhead_tokens": args.fixed_overhead_tokens,
+            "prefix_tokens": prefix_tokens, "max_packet_input_tokens": max(x["estimated_input_tokens"] for x in plan["chunks"])},
+        "artifact_bytes": sum(len(value.encode("utf-8")) for value in artifacts.values()), "warnings": warnings}
+    snapshot_id = digest_value(status).split(":")[1][:24]
+    output = args.output_dir.resolve() if args.output_dir else inside(project / "contexts", job_id)
+    destination = output / "snapshots" / snapshot_id
+    # Content-addressed files are never overwritten. The one pointer is published
+    # only after every artifact exists and has been read back successfully.
+    for relative, text in {**artifacts, "bundle-status.json": json_text(status)}.items():
+        path = inside(destination, relative)
+        if path.exists() and path.read_text(encoding="utf-8-sig") != text:
+            raise ValueError(f"immutable bundle differs: {path}")
+        if not path.exists():
+            atomic_text(path, text)
+        if digest_text(path.read_text(encoding="utf-8-sig")) != digest_text(text):
+            raise ValueError(f"bundle write verification failed: {path}")
+    atomic_text(output / "current.json", json_text({"schema_version": 1, "snapshot": f"snapshots/{snapshot_id}",
+                "status_sha256": digest_text(json_text(status))}))
+    return {"job_id": job_id, "snapshot": str(destination), "entry_count": len(scene), "chunk_count": plan["chunk_count"],
+            "shared_prefix_id": manifest["prefix_id"], "budget": status["budget"], "warnings": warnings}
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project_root", type=Path)
-    parser.add_argument("job_id")
-    parser.add_argument(
-        "--max-bundle-chars",
-        type=int,
-        default=0,
-        help="deprecated advisory only; exceeding it no longer invalidates a bundle",
-    )
+    parser.add_argument("job_id", nargs="?")
+    parser.add_argument("--jobs", nargs="+")
+    parser.add_argument("--all-pending", action="store_true")
     parser.add_argument("--chunk-target-chars", type=int, default=45000)
     parser.add_argument("--chunk-overlap-entries", type=int, default=8)
+    parser.add_argument("--input-budget-tokens", type=int, default=32000, help="planning cap, not a claim about the host window")
+    parser.add_argument("--output-reserve-tokens", type=int, default=8192)
+    parser.add_argument("--fixed-overhead-tokens", type=int, default=0, help="observed host instructions/tools/history budget allocation")
+    parser.add_argument("--context-window-tokens", type=int)
+    parser.add_argument("--encoding", help="optional tiktoken encoding; still labeled a proxy")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--contract", type=Path)
     parser.add_argument("--shared-prefix-manifest", type=Path)
-    parser.add_argument("--require-shared-prefix", action="store_true")
+    parser.add_argument("--require-shared-prefix", action="store_true", help="compatibility flag; v3 always binds a frozen prefix")
     parser.add_argument("--standalone", action="store_true")
+    parser.add_argument("--max-bundle-chars", type=int, default=0, help="deprecated; use token planning caps")
     args = parser.parse_args()
-
-    if args.chunk_overlap_entries < 0:
-        parser.error("--chunk-overlap-entries must be >= 0")
-    if args.standalone and args.require_shared_prefix:
-        parser.error("--standalone and --require-shared-prefix cannot be combined")
-
-    project = args.project_root.resolve()
-    jobs = read_jsonl(project / "planning/jobs.jsonl")
-    matches = [job for job in jobs if job.get("job_id") == args.job_id]
-    if len(matches) != 1:
-        parser.error(f"expected one job {args.job_id!r}, found {len(matches)}")
-    job = matches[0]
-
-    gate_issues = validate_project(project, "plan-approved")
-    if gate_issues:
-        parser.error("project is not delegation-ready: " + " | ".join(gate_issues))
-    bible_state = read_json(project / "bible/version.json", {})
-    if bible_state.get("frozen") is not True:
-        parser.error("bible/version.json is not frozen")
-    if job.get("bible_version") != bible_state.get("version"):
-        parser.error("job bible_version does not match bible/version.json")
-    if job.get("plan_approved") is not True:
-        parser.error("job plan_approved must be true")
-
-    source_records = read_jsonl(project / "extracted/source.jsonl")
-    source_by_id = {item.get("id"): item for item in source_records}
-    entry_ids = job.get("entry_ids", [])
-    if not isinstance(entry_ids, list) or not entry_ids:
-        parser.error("job has no entry_ids")
-    missing = [entry_id for entry_id in entry_ids if entry_id not in source_by_id]
-    if missing:
-        parser.error(f"job references missing source ids: {missing[:10]}")
-    scene = [source_by_id[entry_id] for entry_id in entry_ids]
-    actual_digest = source_digest(scene)
-    if job.get("source_digest") != actual_digest:
-        parser.error("job source_digest does not match current source records")
-
-    adjacent_ids = job.get("adjacent_entry_ids", [])
-    if not isinstance(adjacent_ids, list):
-        parser.error("job adjacent_entry_ids must be an array")
-    adjacent_missing = [value for value in adjacent_ids if value not in source_by_id]
-    if adjacent_missing:
-        parser.error(f"job references missing adjacent ids: {adjacent_missing[:10]}")
-    entry_id_set = set(entry_ids)
-    adjacent = [source_by_id[value] for value in adjacent_ids if value not in entry_id_set]
-
+    if sum(bool(x) for x in (args.job_id, args.jobs, args.all_pending)) != 1:
+        parser.error("choose one job_id, --jobs, or --all-pending")
+    if args.fixed_overhead_tokens < 0 or args.chunk_overlap_entries < 0 or min(args.input_budget_tokens, args.output_reserve_tokens) <= 0:
+        parser.error("invalid budget or overlap")
+    if args.context_window_tokens is not None and args.context_window_tokens <= args.output_reserve_tokens:
+        parser.error("context window must exceed output reserve")
     try:
-        shared_manifest_path, shared_manifest = resolve_shared_manifest(
-            project, args.shared_prefix_manifest, args.standalone
-        )
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        project = args.project_root.resolve()
+        counter = TokenCounter(args.encoding)
+        with read_snapshot() as stats:
+            issues = validate_project(project, "plan-approved")
+            if issues:
+                raise ValueError(" | ".join(issues))
+            jobs = read_jsonl(project / "planning/jobs.jsonl")
+            wanted = set(args.jobs or ([args.job_id] if args.job_id else [j["job_id"] for j in jobs if j.get("status") == "pending"]))
+            if not wanted or wanted - {j["job_id"] for j in jobs}:
+                raise ValueError("no matching jobs, or unknown requested job IDs")
+            if args.output_dir and len(wanted) != 1:
+                raise ValueError("--output-dir requires exactly one job")
+            sources = {row["id"]: row for row in read_jsonl(project / "extracted/source.jsonl")}
+            results = [build_job(project, job, args, sources, counter) for job in jobs if job["job_id"] in wanted]
+        print(json.dumps({"jobs": results, "input_snapshot": {key: stats[key] for key in ("physical_reads", "file_cache_misses", "verification_reads", "parsed_jsonl_records")}}, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))
-    if args.require_shared_prefix and shared_manifest is None:
-        parser.error("no valid shared prefix manifest is available")
-    if shared_manifest is not None:
-        if shared_manifest.get("bible_version") != job.get("bible_version"):
-            parser.error("shared prefix bible_version does not match the job")
-        job_decision_digest = str(job.get("decision_snapshot_digest") or "")
-        shared_decision = shared_manifest.get("decision_snapshot", {})
-        shared_decision_digest = (
-            str(shared_decision.get("sha256") or "")
-            if isinstance(shared_decision, dict)
-            else ""
-        )
-        if job_decision_digest and job_decision_digest != shared_decision_digest:
-            parser.error("job decision snapshot does not match shared prefix")
-
-    scene_model = [model_record(item) for item in scene]
-    adjacent_model = [model_record(item) for item in adjacent]
-    source_text = jsonl_text(scene)
-    adjacent_text = jsonl_text(adjacent)
-    source_model_text = jsonl_text(scene_model)
-    adjacent_model_text = jsonl_text(adjacent_model)
-    source_manifest = {
-        "schema_version": 1,
-        "job_id": args.job_id,
-        "source_digest": actual_digest,
-        "records": [machine_record(item) for item in scene],
-    }
-
-    chunk_plan, coverage_plan, chunk_files = build_chunk_artifacts(
-        scene, args.chunk_target_chars, args.chunk_overlap_entries
-    )
-    chunk_plan["job_id"] = args.job_id
-    chunk_plan["source_digest"] = actual_digest
-    coverage_plan["job_id"] = args.job_id
-    coverage_plan["source_digest"] = actual_digest
-    if coverage_plan.get("valid") is not True:
-        parser.error("generated chunk coverage is invalid")
-    chunk_plan_text = canonical_json(chunk_plan)
-    coverage_plan_text = canonical_json(coverage_plan)
-
-    output_dir = (
-        args.output_dir.resolve()
-        if args.output_dir
-        else project / "contexts" / args.job_id
-    )
-    source_output = output_dir / "source.jsonl"
-    source_model_output = output_dir / "source.model.jsonl"
-    adjacent_output = output_dir / "adjacent.jsonl"
-    adjacent_model_output = output_dir / "adjacent.model.jsonl"
-    draft_output = project / "translations/drafts" / f"{args.job_id}.jsonl"
-    review_output = project / "reviews" / f"{args.job_id}.jsonl"
-    route = str(job.get("route") or "unassigned")
-
-    binding: dict[str, Any] = {
-        "mode": "shared-prefix" if shared_manifest else "standalone",
-        "shared_prefix_manifest": (
-            project_relative(project, shared_manifest_path)
-            if shared_manifest_path
-            else None
-        ),
-        "shared_prefix_id": shared_manifest.get("prefix_id") if shared_manifest else None,
-        "shared_prefix_sha256": (
-            shared_manifest.get("prefix_sha256") if shared_manifest else None
-        ),
-        "decision_snapshot": (
-            shared_manifest.get("decision_snapshot") if shared_manifest else None
-        ),
-    }
-    task_data = {
-        "job_id": args.job_id,
-        "route": route,
-        "scene_ids": job.get("scene_ids", []),
-        "entry_count": len(scene),
-        "source_digest": actual_digest,
-        "bible_version": job.get("bible_version"),
-        "predecessors": job.get("predecessors", []),
-        "time": job.get("time", ""),
-        "location": job.get("location", ""),
-        "prior_summary": job.get("prior_summary", ""),
-        "context_notes": job.get("context_notes", ""),
-        "job_source_model": project_relative(project, source_model_output),
-        "adjacent_source_model": project_relative(project, adjacent_model_output),
-        "source_manifest": project_relative(project, output_dir / "source-manifest.json"),
-        "chunk_plan": project_relative(project, output_dir / "chunk-plan.json"),
-        "coverage_plan": project_relative(project, output_dir / "coverage-plan.json"),
-        "draft_output": project_relative(project, draft_output),
-        "review_output": project_relative(project, review_output),
-    }
-    context_parts = [
-        f"# 翻译任务 {args.job_id}",
-        "## 共享前缀绑定\n\n" + json_block(binding),
-        "## 任务与边界\n\n" + json_block(task_data),
-        "## 执行要求\n\n"
-        "共享前缀模式下，不要重新读取 Bible、翻译契约或 decisions；它们必须已经存在于干净种子历史中。"
-        "按 `chunk-plan.json` 处理全部 primary ID；overlap 文件只读，不得重复输出。"
-        "优先读取 `source.model.jsonl` 或对应 chunk 模型视图，机器字段由验证和合并工具补回。",
-    ]
-
-    matched_characters = 0
-    matched_terms = 0
-    if shared_manifest is None:
-        scene_text = "\n".join(str(item.get("text") or "") for item in scene)
-        speakers = {
-            str(item["speaker"])
-            for item in scene
-            if item.get("speaker") not in (None, "")
-        }
-        characters = select_characters(
-            read_json(project / "bible/characters.json", {}), speakers, scene_text
-        )
-        voice = select_voice(
-            read_json(project / "bible/voice.json", {}), speakers, characters
-        )
-        glossary = read_glossary(project / "bible/glossary.tsv", scene_text, speakers)
-        route_knowledge = select_route_knowledge(
-            read_json(project / "bible/route-knowledge.json", {}), route
-        )
-        calibration = select_calibration(
-            project / "bible/calibration.jsonl", speakers, glossary
-        )
-        skill_root = Path(__file__).resolve().parent.parent
-        contract_path = (
-            args.contract.resolve()
-            if args.contract
-            else skill_root / "references/translation-contract.md"
-        )
-        if not contract_path.is_file():
-            parser.error(f"translation contract not found: {contract_path}")
-        contract = contract_path.read_text(encoding="utf-8-sig")
-        world_path = project / "bible/world.md"
-        honorifics_path = project / "bible/honorifics.md"
-        context_parts.extend(
-            (
-                "## 翻译契约\n\n" + contract,
-                "## 世界观\n\n" + world_path.read_text(encoding="utf-8-sig"),
-                "## 路线与当前知识状态\n\n" + json_block(route_knowledge),
-                "## 称谓与敬称\n\n"
-                + honorifics_path.read_text(encoding="utf-8-sig"),
-                "## 本场景角色卡\n\n" + json_block(characters),
-                "## 本场景口吻卡\n\n" + json_block(voice),
-                "## 本场景命中术语\n\n" + json_block(glossary),
-                "## 相关批准译例\n\n" + json_block(calibration),
-            )
-        )
-        matched_characters = len(characters)
-        matched_terms = len(glossary)
-
-    context = "\n\n".join(context_parts).rstrip() + "\n"
-    bundle_chars = (
-        len(context)
-        + len(source_text)
-        + len(adjacent_text)
-        + len(source_model_text)
-        + len(adjacent_model_text)
-    )
-    warnings: list[str] = []
-    if args.max_bundle_chars > 0 and bundle_chars > args.max_bundle_chars:
-        warnings.append(
-            f"bundle_chars {bundle_chars} exceeds deprecated advisory "
-            f"{args.max_bundle_chars}; chunk plan remains valid"
-        )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    chunks_dir = output_dir / "chunks"
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-    for stale in chunks_dir.glob("*.jsonl"):
-        stale.unlink()
-    (output_dir / "context.md").write_text(context, encoding="utf-8", newline="\n")
-    source_output.write_text(source_text, encoding="utf-8", newline="\n")
-    source_model_output.write_text(
-        source_model_text, encoding="utf-8", newline="\n"
-    )
-    adjacent_output.write_text(adjacent_text, encoding="utf-8", newline="\n")
-    adjacent_model_output.write_text(
-        adjacent_model_text, encoding="utf-8", newline="\n"
-    )
-    (output_dir / "source-manifest.json").write_text(
-        canonical_json(source_manifest), encoding="utf-8", newline="\n"
-    )
-    (output_dir / "chunk-plan.json").write_text(
-        chunk_plan_text, encoding="utf-8", newline="\n"
-    )
-    (output_dir / "coverage-plan.json").write_text(
-        coverage_plan_text, encoding="utf-8", newline="\n"
-    )
-    for relative, text_value in chunk_files.items():
-        path = output_dir / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text_value, encoding="utf-8", newline="\n")
-
-    stale_budget = output_dir / "budget-report.json"
-    if stale_budget.exists():
-        stale_budget.unlink()
-    bundle_status = {
-        "schema_version": BUNDLE_SCHEMA,
-        "valid": True,
-        "job_id": args.job_id,
-        "source_digest": actual_digest,
-        "bible_version": job.get("bible_version"),
-        "shared_prefix_id": binding["shared_prefix_id"],
-        "shared_prefix_sha256": binding["shared_prefix_sha256"],
-        "skill_name": "translate-galgame-zh",
-        "skill_revision": SKILL_REVISION,
-        "entry_count": len(scene),
-        "adjacent_entry_count": len(adjacent),
-        "chunk_count": chunk_plan["chunk_count"],
-        "chunk_plan_sha256": sha256_text(chunk_plan_text),
-        "coverage_plan_sha256": sha256_text(coverage_plan_text),
-        "source_model_sha256": sha256_text(source_model_text),
-        "bundle_chars": bundle_chars,
-        "warnings": warnings,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    (output_dir / "bundle-status.json").write_text(
-        canonical_json(bundle_status), encoding="utf-8", newline="\n"
-    )
-
-    print(
-        json.dumps(
-            {
-                "job_id": args.job_id,
-                "context": str(output_dir / "context.md"),
-                "source_model": str(source_model_output),
-                "entry_count": len(scene),
-                "adjacent_entry_count": len(adjacent),
-                "chunk_count": chunk_plan["chunk_count"],
-                "bundle_chars": bundle_chars,
-                "shared_prefix_id": binding["shared_prefix_id"],
-                "matched_characters_standalone": matched_characters,
-                "matched_terms_standalone": matched_terms,
-                "warnings": warnings,
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 0
 
 
 if __name__ == "__main__":

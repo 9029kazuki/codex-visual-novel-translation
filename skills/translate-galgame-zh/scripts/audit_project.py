@@ -11,6 +11,7 @@ import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from pipeline_common import read_json as snapshot_json, read_jsonl as snapshot_jsonl, validate_bundle, digest_text, read_text, inside
 
 
 STAGES = (
@@ -41,25 +42,16 @@ SHA256_PATTERN = re.compile(r"sha256:[0-9a-fA-F]{64}\Z")
 
 def read_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return snapshot_json(path)
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]] | None:
-    records: list[dict[str, Any]] = []
     try:
-        with path.open("r", encoding="utf-8-sig") as stream:
-            for raw in stream:
-                if not raw.strip():
-                    continue
-                value = json.loads(raw)
-                if not isinstance(value, dict):
-                    return None
-                records.append(value)
-    except (OSError, json.JSONDecodeError):
+        return snapshot_jsonl(path)
+    except (OSError, ValueError):
         return None
-    return records
 
 
 def directory_has_file(path: Path) -> bool:
@@ -395,8 +387,8 @@ def validate_gate(project: Path, stage: str) -> list[str]:
             for job in jobs:
                 if job.get("plan_approved") is not True:
                     issues.append(f"job {job.get('job_id')} is not plan_approved")
-                if job.get("bible_version") != bible_version:
-                    issues.append(f"job {job.get('job_id')} has stale bible_version")
+                if not isinstance(job.get("bible_version"), int) or job["bible_version"] < 1:
+                    issues.append(f"job {job.get('job_id')} needs its frozen bible_version")
                 entry_ids = job.get("entry_ids", [])
                 if isinstance(entry_ids, list):
                     digest_records = [
@@ -482,34 +474,8 @@ def validate_gate(project: Path, stage: str) -> list[str]:
         active_jobs = [job for job in jobs if job.get("status") in active]
         if not active_jobs:
             issues.append("no job has entered translation")
-        if project_schema_version(project) >= 2:
-            prefix_issues, prefix_manifest = validate_current_shared_prefix(project)
-            issues.extend(prefix_issues)
-            prefix_id = (
-                prefix_manifest.get("prefix_id") if isinstance(prefix_manifest, dict) else None
-            )
-            prefix_digest = (
-                prefix_manifest.get("prefix_sha256")
-                if isinstance(prefix_manifest, dict)
-                else None
-            )
-            for job in active_jobs:
-                job_id = str(job.get("job_id") or "")
-                status = read_json(project / "contexts" / job_id / "bundle-status.json")
-                if not isinstance(status, dict) or status.get("valid") is not True:
-                    issues.append(f"job {job_id} has no valid bundle-status.json")
-                    continue
-                if status.get("source_digest") != job.get("source_digest"):
-                    issues.append(f"job {job_id} bundle source_digest is stale")
-                if status.get("bible_version") != job.get("bible_version"):
-                    issues.append(f"job {job_id} bundle bible_version is stale")
-                if status.get("shared_prefix_id") != prefix_id:
-                    issues.append(f"job {job_id} bundle uses a different shared prefix")
-                if status.get("shared_prefix_sha256") != prefix_digest:
-                    issues.append(f"job {job_id} bundle shared prefix digest is stale")
-                coverage = read_json(project / "contexts" / job_id / "coverage-plan.json")
-                if not isinstance(coverage, dict) or coverage.get("valid") is not True:
-                    issues.append(f"job {job_id} coverage-plan.json is invalid")
+        for job in active_jobs:
+            issues.extend(validate_bundle(project, job))
 
     elif stage == "reviewed":
         jobs = read_jsonl(project / "planning/jobs.jsonl") or []
@@ -530,6 +496,13 @@ def validate_gate(project: Path, stage: str) -> list[str]:
                     not isinstance(report, dict)
                     or report.get("passed") is not True
                     or report.get("coverage") != "all-entries"
+                    or report.get("job_id") != job.get("job_id")
+                    or not report.get("reviewer")
+                    or report.get("reviewer") == report.get("translator")
+                    or not report.get("translator")
+                    or (job.get("worker") and report.get("translator") != job.get("worker"))
+                    or (job.get("reviewer") and report.get("reviewer") != job.get("reviewer"))
+                    or report.get("review_delta_digest") != compute_records_digest(read_jsonl(project / "reviews" / f"{job.get('job_id')}.jsonl") or [])
                     or report.get("reviewed_source_digest") != job.get("source_digest")
                     or report.get("reviewed_entry_count") != len(job.get("entry_ids", []))
                     or not isinstance(draft, list)
@@ -546,6 +519,18 @@ def validate_gate(project: Path, stage: str) -> list[str]:
         report = read_json(project / "qa/global.json")
         if not isinstance(report, dict) or report.get("errors") != 0:
             issues.append("qa/global.json must report errors=0")
+        else:
+            try:
+                source = (project / "extracted/source.jsonl").resolve()
+                glossary = (project / "bible/glossary.tsv").resolve()
+                target = Path(report["translation"]).resolve()
+                if Path(report["source"]).resolve() != source or report.get("allow_subset") is not False:
+                    raise ValueError("global QA must validate the full canonical source")
+                for path in (source, target, glossary):
+                    if report.get("input_digests", {}).get(str(path)) != digest_text(read_text(path)):
+                        raise ValueError(f"global QA input changed or was not checked: {path}")
+            except (KeyError, OSError, ValueError, TypeError) as exc:
+                issues.append(str(exc))
 
     elif stage == "repacked":
         if not directory_has_file(project / "build"):
@@ -554,6 +539,32 @@ def validate_gate(project: Path, stage: str) -> list[str]:
             issues.append("qa/repack-report.json must contain passed=true")
 
     elif stage == "playtested":
+        font = read_json(project / "qa/font-coverage.json")
+        if not isinstance(font, dict) or font.get("passed") is not True or font.get("missing_count") != 0:
+            issues.append("qa/font-coverage.json must pass with missing_count=0")
+        repack = read_json(project / "qa/repack-report.json")
+        if not isinstance(font, dict) or not isinstance(repack, dict) or not font.get("build_digest") or font.get("build_digest") != repack.get("build_digest"):
+            issues.append("font coverage report must bind the repacked build")
+        runtime = read_json(project / "qa/font-runtime-report.json")
+        if not isinstance(runtime, dict) or runtime.get("passed") is not True or not runtime.get("build_digest"):
+            issues.append("qa/font-runtime-report.json needs passed=true and build_digest")
+        else:
+            for profile in ("fresh", "existing"):
+                surfaces = runtime.get("profiles", {}).get(profile, {})
+                for surface in ("body", "namebox", "choice", "history", "settings", "save_title"):
+                    result = surfaces.get(surface)
+                    if not isinstance(result, dict) or result.get("status") != "pass" or not result.get("evidence"):
+                        issues.append(f"font runtime {profile}/{surface} needs pass and evidence")
+                    else:
+                        try:
+                            evidence = result["evidence"]
+                            if not isinstance(evidence, list) or any(not isinstance(x, str) or not inside(project, x).is_file() for x in evidence):
+                                raise ValueError("evidence must list existing project files")
+                        except (ValueError, TypeError) as exc:
+                            issues.append(f"font runtime {profile}/{surface}: {exc}")
+            repack = read_json(project / "qa/repack-report.json")
+            if not isinstance(repack, dict) or repack.get("build_digest") != runtime.get("build_digest"):
+                issues.append("font runtime report must bind the repacked build")
         if not passed_report(project / "qa/playtest-report.json"):
             issues.append("qa/playtest-report.json must contain passed=true")
 

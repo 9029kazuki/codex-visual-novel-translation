@@ -36,7 +36,7 @@ project/
 │   └── decision-snapshots/
 ├── contexts/
 │   ├── shared-prefix/
-│   └── <job_id>/
+│   └── <job_id>/current.json → snapshots/<snapshot-id>/
 ├── translations/
 │   ├── drafts/
 │   ├── approved/
@@ -108,9 +108,9 @@ project/
 
 - 主智能体批准任务边界。
 - 每个任务把 `plan_approved` 设为 `true`，并填写适用的时间、地点、前情、前驱和相邻原文 ID；无需求时明确说明“无需额外上下文”。
-- 每个任务绑定原文哈希和资料库版本。
+- 每个任务绑定原文/邻接内容、任务契约、自己的资料快照与语义依赖。资料库版本数字只作追溯，实际失效由依赖内容判断。
 - 冻结一份翻译决策快照，运行 `build_shared_prefix.py`，并让每个正式任务同时绑定 `shared_prefix_id`、共享前缀哈希和决策快照哈希。
-- 每个任务的 `bundle-status.json`、`chunk-plan.json` 和 `coverage-plan.json` 有效；每个原文 ID 恰好属于一个 primary chunk，overlap 不计入输出覆盖。
+- 由 `contexts/<job>/current.json` 解析当前快照；该快照的 `bundle-status.json`、实际分批文件、`chunk-plan.json` 和 `coverage-plan.json` 摘要与内容均有效；每个原文 ID 恰好属于一个 primary chunk，overlap 不计入输出覆盖。
 - 每个草稿通过结构验证后才进入审校。
 
 ### 发布门禁
@@ -131,6 +131,10 @@ pending -> assigned -> translated -> validated -> reviewed -> approved -> merged
                          \-> failed -> pending
 ```
 
-每次子智能体开始前把任务设为 `assigned`；收到译文后立即验证。进程中断时，将没有完整输出的 `assigned` 任务恢复为 `pending`，不要重做已批准任务。使用原子写入脚本更新状态，避免并行写坏任务表。
+每次子智能体开始前把任务设为 `assigned`；收到译文后立即验证。进程中断时，将没有完整输出的 `assigned` 任务恢复为 `pending`，不要重做已批准任务。主智能体使用原子脚本更新状态，保持任务表单写者。合法相同迁移可用 `--also-job` 批量提交；依赖失效返回 pending 使用 `--invalidate --note …`。原子替换不能解决多个同时写者的更新丢失。
 
 在所有生成物中记录：技能版本、资料库版本、共享前缀 ID/哈希、决策快照哈希、原文哈希、任务 ID、生成时间、执行者角色和验证结果。不把可变时间戳、绝对路径或运行状态写入共享 Prompt 前缀；它们只属于机器报告。
+
+## v3 恢复与资料变化
+
+使用 `audit_dependencies.py` 区分可复用与失效任务。保留旧快照，不让所有任务追随 current。任务包重建先写新不可变目录，完整核验后才切换指针；失败时不删除旧包。升级已有项目按 [performance-and-migration.md](performance-and-migration.md) 处理，不静默补造审校声明。

@@ -42,18 +42,24 @@
 同时写入 `reviews/<job_id>.report.json`，至少包含：
 
 ```json
-{"schema_version":2,"job_id":"job-00001","reviewed_source_digest":"sha256:...","reviewed_draft_digest":"sha256:...","reviewed_entry_count":607,"coverage":"all-entries","delta_count":31,"passed":true}
+{"schema_version":3,"job_id":"job-00001","reviewer":"reviewer-01","translator":"translator-01","reviewed_source_digest":"sha256:...","reviewed_draft_digest":"sha256:...","review_delta_digest":"sha256:...","reviewed_entry_count":607,"coverage":"all-entries","delta_count":31,"passed":true}
 ```
 
-`coverage: all-entries` 声明代表其余条目均默认 approve；只有 report 中的原文/草稿摘要与当前文件一致时才有效。物化批准稿时，对 delta ID 使用 `reviewer_translation`，其余 ID 使用草稿译文。稀疏输出只减少冗余，不减少独立审校的覆盖。
+独立审校完成后用 `create_review_report.py --all-entries-reviewed --outcome passed --reviewer … --translator …` 记录明确声明；有待裁决问题时用 `needs-resolution`。脚本不代替语义阅读。
+
+`severity` 只接受 `minor`（措辞、轻微口吻等）或 `major`（语义、人物关系、知识泄漏等）。两种都必须给出修订和理由；尚未解决时声明 `needs-resolution`。声明脚本会先检查 delta 的结构与控制符。
+
+`coverage: all-entries` 声明代表其余条目均默认 approve；只有 report 中的原文/草稿摘要与当前文件一致时才有效。物化批准稿时，对 delta ID 使用 `reviewer_translation`，其余 ID 使用草稿译文。稀疏输出只减少冗余，不减少独立审校的覆盖。`apply_review_delta.py` 必须读取已有通过声明，核对真实不同身份和 source/draft/delta 摘要；缺失、失败或过期均拒绝。原声明不改写，另写 `.report.materialization.json`，记录批准稿摘要。
 
 ## 跨分批与全局一致性
+
+修订重试由主协调者选择当前尝试。先把旧 draft、delta、声明、已有物化收据和 approved 原样归档到 `reviews/history/<job>/<attempt>/`，记录各文件摘要；没有生成的产物明确标记不存在。保留归档后，再创建新的 canonical `reviews/<job>.jsonl` 和 `<job>.report.json`，重新物化及 QA。`merge_jobs.py` 只读取当前 canonical 名称；单独换成 `attempt2.report.json` 不会自动被选入合并。子智能体不得自行覆盖共享产物或选择发布尝试。
 
 一个 job 的所有 chunk 完成后，进入审校前先做一次轻量全 job 扫描，至少检查称谓、术语、人名、跨批指代、时间顺序、重复原文与场景收束。全部 job 物化后再做全项目一致性扫描。
 
 ## 缓存与调用可观测性
 
-若宿主提供 input/cache/output 计数，按 cohort 和 job 记录到 `qa/cache/`，分别报告总输入、缓存输入、非缓存输入、输出和调用数；不把缓存 Token 当作零成本。每次还应记录 prefix ID/哈希、bundle 大小、chunk 数和历史继承模式。同一 prefix cohort 频繁失去缓存命中时报告为效率异常，但不降低翻译质量门禁。
+若宿主提供 input/cache/output 计数，按 cohort 和 job 记录到 `qa/cache/`，按 request_id 去重，分别报告总输入、缓存读、缓存写、普通输入、输出和调用数，未知值用 null；不把缓存 Token 当作零成本。每次还应记录 prefix ID/哈希、bundle 大小、chunk 数和历史继承模式。同一 prefix cohort 频繁失去缓存命中时报告为效率异常，但不降低翻译质量门禁。
 
 ## 回填 QA
 
@@ -98,3 +104,13 @@
 ## 完成判定
 
 只有所有计划任务为 `merged`、全局验证无 error、回填与封包成功、实机矩阵达到约定覆盖范围且发布物在干净副本验证通过时，才将 `run-state.json` 更新为 `released`。
+
+## v3 合并与字体报告绑定
+
+合并使用 `merge_jobs.py <source> <approved-dir> <output> --jobs-jsonl <jobs>`，只采纳清单中 approved/merged 的任务，并核验条目覆盖和物化收据。不要扫描历史备份决定发布内容。
+
+`qa/font-coverage.json` 与 `qa/font-runtime-report.json` 的 `build_digest` 必须等于 `qa/repack-report.json` 的同名字段。静态审计以 `--build-digest` 绑定完成封包后的构建；字体或显示文本改变须重新审计。`profiles` 包含 `fresh` 与 `existing` 两种配置；每种配置下 body、namebox、choice、history、settings、save_title 均提供 `{"status":"pass","evidence":["相对证据路径"]}`，证据文件必须实际存在于项目中。未测试不能改为 pass。
+
+全局 `validate_translation.py` 不使用 `--allow-subset`，同时提供权威 source、合并稿、`--glossary` 和 `--report qa/global.json`。门禁核对三个输入的内容摘要，译文或术语变化后旧报告不能继续放行。
+
+对实际没有的文本表面应在项目前期明确目标和适配方案；默认门禁要求上述六类表面。完整补丁不能以通用 playtest 的 passed 标记替代字体证据。

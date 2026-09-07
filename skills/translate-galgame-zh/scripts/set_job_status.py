@@ -33,7 +33,19 @@ def main() -> int:
     parser.add_argument("--worker")
     parser.add_argument("--reviewer")
     parser.add_argument("--note")
+    parser.add_argument("--also-job", action="append", default=[], help="apply the same legal transition to additional jobs atomically")
+    parser.add_argument("--invalidate", action="store_true", help="return completed work to pending with an explicit reason")
     args = parser.parse_args()
+    transitions = {
+        "pending": {"assigned", "failed"}, "assigned": {"translated", "failed", "pending"},
+        "translated": {"validated", "failed"}, "validated": {"reviewed", "failed"},
+        "reviewed": {"approved", "failed"}, "approved": {"merged", "failed"},
+        "merged": set(), "failed": {"pending"},
+    }
+    wanted = {args.job_id, *args.also_job}
+    found_ids = set()
+    if args.invalidate and (args.status != "pending" or not args.note):
+        parser.error("--invalidate requires pending and --note explaining the dependency change")
 
     path = args.jobs_jsonl.resolve()
     records: list[dict[str, Any]] = []
@@ -46,9 +58,14 @@ def main() -> int:
                 record = json.loads(raw)
             except json.JSONDecodeError as exc:
                 parser.error(f"{path}:{line_number}: invalid JSON: {exc}")
-            if record.get("job_id") == args.job_id:
-                if found:
+            if record.get("job_id") in wanted:
+                current_id = record["job_id"]
+                if current_id in found_ids:
                     parser.error(f"duplicate job_id: {args.job_id}")
+                found_ids.add(current_id)
+                previous = record.get("status")
+                if not args.invalidate and args.status != previous and args.status not in transitions.get(previous, set()):
+                    parser.error(f"illegal transition for {current_id}: {previous} -> {args.status}")
                 found = True
                 if args.from_status and record.get("status") != args.from_status:
                     parser.error(
@@ -63,8 +80,8 @@ def main() -> int:
                 if args.note:
                     record.setdefault("status_notes", []).append(args.note)
             records.append(record)
-    if not found:
-        parser.error(f"job_id not found: {args.job_id}")
+    if found_ids != wanted:
+        parser.error(f"job IDs not found: {sorted(wanted - found_ids)}")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -82,7 +99,7 @@ def main() -> int:
             pass
         raise
 
-    print(json.dumps({"job_id": args.job_id, "status": args.status}, ensure_ascii=False))
+    print(json.dumps({"job_ids": sorted(wanted), "status": args.status}, ensure_ascii=False))
     return 0
 
 

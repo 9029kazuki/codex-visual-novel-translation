@@ -1,74 +1,58 @@
-# 共享前缀、子智能体种子与分批覆盖
+# 共享资料、请求稳定性与分批
 
-## 目标
+## 冻结与模型视图
 
-让同一翻译或审校批次的所有正式 job 获得同一份完整世界观、人设、口吻、术语、知识门和决策快照，同时避免继承长期主任务中的旧 job、日志和调试输出。
+`build_shared_prefix.py` 生成 UTF-8/LF、稳定键序的四段正文：翻译契约→世界观/角色/口吻→术语/称谓/知识门/译例→生效决策。来源 URL、检索时间等审计字段保留在权威资料中；pending/proposed 不进入生效决策。不要依靠压缩删除翻译所需语义。
 
-缓存是延迟和计算优化，不是记忆或上下文压缩。共享资料即使命中缓存，仍会占用模型上下文窗口。
+快照包含 `shared-prefix.md`、有序 `sections/`、`semantic-inputs.json` 和 manifest。`current.json` 只指定新任务默认采用的快照，不要求已运行任务迁移到它。运行测量存入 `qa/cache`，不写进不可变 manifest。
 
-## 稳定共享前缀
+默认路径为 `contexts/shared-prefix/<prefix-id>/<binding-id>/`：正文身份与物理来源绑定分开。同一正文来自不同冻结文件时可并存，不覆盖旧 manifest；正文哈希相同也不保证宿主实际请求的缓存命中。
 
-运行 `scripts/build_shared_prefix.py` 生成内容寻址的共享前缀。固定顺序为：
+默认使用完整项目资料。大型项目可提供主协调者批准的 profile：
 
-1. 翻译契约与输出结构。
-2. 世界观、完整人设和完整口吻。
-3. 完整术语、称谓策略、路线知识门和批准译例。
-4. 当前批次的冻结 decisions。
-
-工具生成：
-
-```text
-contexts/shared-prefix/<prefix-id>/
-├── sections/
-│   ├── 00-translation-contract.md
-│   ├── 10-canon-and-voice.md
-│   ├── 20-terminology-and-knowledge.md
-│   └── 30-decisions.md
-├── shared-prefix.md
-└── shared-prefix-manifest.json
+```json
+{"mode":"selected","approved":true,"rationale":"已检查人物关系、间接提及与知识门依赖","characters":["misaki","protagonist"],"routes":["route-a"],"extra_scopes":["scene-a-rooftop"]}
 ```
 
-`contexts/shared-prefix/current.json` 只是指向当前快照的指针，不是模型共享前缀的一部分。共享文本中不得包含生成时间、绝对路径、job ID、临时进度或其他每次运行会变的值。
+profile 必须是语义依赖闭包。没有批准与理由的裁剪会被拒绝；未知角色或路线也会失败。全局事实、称谓、全局知识、全局术语与全部生效决策始终保留；目前不自动裁剪决策作用域。角色 ID、名字和别名都可匹配；别名歧义时用唯一 ID。列表必须包含未出场但被提及或影响解释的角色，以及消歧所需的其他路线。
 
-## 两级派发
+同一 profile 的任务可共享完整前缀。job 的 `dependency_scope` 可使用同一格式记录经过批准的更小闭包；缺省使用前缀 profile。资料变更后，审计将冻结依赖与当前权威资料比较，忽略单纯版本号、来源或 pending 变化。全局规则变化可以合法地影响全部任务。
 
-1. 长期主智能体使用 `fork_turns="none"` 创建一个干净种子。
-2. 种子按 manifest 的 `seed_read_order` 顺序完整读取四个 section，不读取任何 job 原文。
-3. 等待种子轮次完成，使各层共享前缀有机会写入缓存。
-4. 先从种子使用 `fork_turns="all"` 派发一个探针 job。种子历史必须只含共享前缀，因此这里的 `all` 不会带入长期主任务污染。
-5. 对照 manifest 和实际 usage 记录探针的 `cached_tokens`；宿主提供计数时使用 `scripts/record_cache_probe.py` 写入 `qa/cache/`。当宿主不暴露精确缓存边界时，明确记录为“最佳努力验证”，不宣称绝对命中。
-6. 探针合格后，从同一种子批量派发其余正式 job。每个 job 只处理一个批准任务。
+## 原生子智能体的稳定历史
 
-当 `fork_turns` 不可控或子智能体不可用时，降级为独立 job bundle；必须仍绑定同一 shared-prefix digest 和 decision snapshot，但不虚报跨请求缓存命中。
+共享文件哈希相同不代表实际模型前缀相同：系统/工具定义、消息顺序、工具调用与输出、路径、版本摘要都可能在正文之前出现。
 
-## 共享前缀不变式
+使用无主对话历史的初始化，保持模型、推理设置、工具定义、契约和读取顺序稳定。加载必要资料后才附加角色与具体 job。长种子持续派发会积累 job 列表、工具返回和其他任务记录；只有宿主支持固定种子检查点时才从该检查点复用。没有检查点能力时使用短生命周期 cohort，抽查首、中、末 worker 的继承情况，不宣称种子永久干净。
 
-- 同一批次使用同一模型、工具集、工具顺序、输出 schema 和共享内容顺序。
-- 文本使用 UTF-8 和 LF；JSON 使用确定性键顺序；不在共享前缀中加入随机数或时间戳。
-- 任何 job 独有内容都在共享前缀之后追加。
-- 一批翻译使用固定 decisions。新术语提案集中裁决后创建新快照，不向正在运行的 job 逐个广播。
-- 如使用可控的 GPT-5.6+ API 编排器，在共享前缀末尾设显式 cache breakpoint，对相同快照使用相同 `prompt_cache_key`。当前 Codex 子智能体接口没有暴露这两个参数时，不得伪造或假定已设置。
+初始化只执行加载与校验，不再次启动整个本地化 skill 的研究和项目协调流程。同一批内部保持路径与消息稳定；跨版本的早期路径/摘要变化仍可能造成冷启动。只有宿主能控制真正的消息拼装时，才可把机器校验信息放到待复用正文之后。
 
-## 任务模型视图
+当前原生接口未暴露 cache key/breakpoint 时，不声称已设置它们。保留现有原生翻译机制，无需为了缓存改用外部翻译 API。缓存不能释放上下文窗口，也不是零成本。
 
-完整原文与回填元数据仍保存在 `source.jsonl` 和 `source-manifest.json`。翻译子智能体优先读取 `source.model.jsonl`，其中只保留：
+## 分批读取与预算
 
 ```text
-id / kind / speaker / text / protected_tokens
+contexts/<job>/current.json
+  → snapshots/<snapshot-id>/bundle-status.json
+                           context.md
+                           source.jsonl / source.model.jsonl
+                           chunk-plan.json / coverage-plan.json
+                           chunks/<chunk>.packet.json
 ```
 
-机器字段由验证和合并工具按 ID 从冻结原文补回。子智能体不得依赖模型视图中没有的回填位置、归档偏移或其他机器字段。
+源文件、回填元数据和覆盖清单由机器保管。模型读取经 `emit_chunk.py <project> <job> <chunk>` 验证的 packet，包含任务上下文、primary 原文、必要邻接与重叠原文。只对 primary 输出译文。不要先读全量 source.model 再读所有 chunk。
 
-## 超大任务的分批覆盖
+`build_context_bundle.py` 的默认 32,000 是模型附加输入的规划上限，不代表宿主实际窗口；默认另预留 8,192 输出 token。可以按宿主测得的余量指定 `--input-budget-tokens`、`--fixed-overhead-tokens`、`--output-reserve-tokens` 和 `--context-window-tokens`。计入已有工具/指令/历史，检查工具返回上限；若传入的预算已经扣除了宿主开销，不能重复扣减。
 
-完整 bundle 不设置固定总字符失败上限。`build_context_bundle.py` 生成 `chunk-plan.json`，每批包含：
+默认使用 UTF-8 字节数作保守的本地规划估算；安装 tiktoken 并传 `--encoding` 可用指定编码的代理计数。二者都不叫真实 usage。`budget.actual_usage_verified` 保持 false，除非另有真实宿主测量证据。
 
-- 稳定 `chunk_id`。
-- 唯一的 `primary_entry_ids`。
-- 只读的 `overlap_before_ids` 与 `overlap_after_ids`。
-- 自然场景边界与强制切分标记。
-- 对应的模型原文文件。
+共享前缀、必要上下文或单条记录超预算时明确失败，调整已批准 profile、宿主允许的预算或制定超长条目方案。不要静默切坏条目。必要邻接原文不删减；可选 overlap 因预算缩减会被标记。源 ID 顺序和覆盖必须不变。
 
-`coverage-plan.json` 必须证明每个计划 ID 恰好属于一个 primary 范围。重叠 ID 只用于语义承接，不得重复输出译文。各分批完成后运行一次全局一致性扫描，再允许进入审校或合并。
+每批译文写独立文件并记录摘要，汇总后生成 job 草稿。分批不会自动清空历史：结合窗口余量和已出现的无关历史决定何时建立新工作上下文。交接只带有证据 ID 的人物状态、公开知识、称谓、悬念、未解决指代和前批结尾；必要时补读原文。最终仍进行完整场景独立审校。
 
-`bundle-status.json` 是当前 bundle 的唯一有效状态入口，并引用 source digest、shared-prefix digest、chunk-plan digest 和 coverage digest。成功重建后删除旧 `budget-report.json`；不允许有效状态与残留失败报告并存。
+## 缓存观测
+
+优先让第一个实际任务承担探针，不做重复空预热。记录逐请求的 input、cached、cache-write、output、模型/推理设置、历史模式、任务/分批、耗时和重试原因。
+
+`record_cache_probe.py --usage-jsonl <requests>` 接受每行一个唯一 request_id 的本次 usage；相同重复事件去重，冲突重复事件或累计计数拒绝。整体命中率用总缓存读除以总输入。单独的文件 token 数不能证明命中某段完整资料，缺少渲染边界或请求 ID 时只记录 observed-only。
+
+已知单次完整边界时可使用 `--boundary-kind rendered-prefix --expected-prefix-tokens … --request-id …`。tolerance 必须小于正边界；这是对声明边界的最佳努力检查，不保证宿主路由或订阅计费。

@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+from pipeline_common import atomic_text, digest_text, inside, read_json
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -31,6 +32,7 @@ def main() -> int:
     parser.add_argument("approved_dir", type=Path)
     parser.add_argument("output_jsonl", type=Path)
     parser.add_argument("--allow-incomplete", action="store_true")
+    parser.add_argument("--jobs-jsonl", type=Path, required=True, help="approved job manifest; historical directory contents are ignored")
     args = parser.parse_args()
 
     source_path = args.source_jsonl.resolve()
@@ -51,7 +53,21 @@ def main() -> int:
 
     translations: dict[str, dict[str, Any]] = {}
     origins: dict[str, Path] = {}
-    files = sorted(approved_dir.rglob("*.jsonl"), key=lambda path: path.as_posix().casefold())
+    jobs = read_jsonl(args.jobs_jsonl.resolve())
+    if not jobs or len({job.get("job_id") for job in jobs}) != len(jobs):
+        parser.error("job manifest is empty or has duplicate job IDs")
+    complete = [job for job in jobs if job.get("status") in {"approved", "merged"}]
+    if len(complete) != len(jobs) and not args.allow_incomplete:
+        parser.error("every planned job must be approved or merged")
+    files = [inside(approved_dir, f"{job['job_id']}.jsonl") for job in complete]
+    project = args.jobs_jsonl.resolve().parent.parent
+    for job, path in zip(complete, files):
+        receipt = read_json(project / "reviews" / f"{job['job_id']}.report.materialization.json")
+        declaration = project / "reviews" / f"{job['job_id']}.report.json"
+        if receipt.get("approved_digest") != digest_text(path.read_text(encoding="utf-8-sig")) or receipt.get("reviewed_source_digest") != job.get("source_digest") or receipt.get("verified_review_report_digest") != digest_text(declaration.read_text(encoding="utf-8-sig")):
+            parser.error(f"approved artifact or review receipt is stale: {job['job_id']}")
+        if [row.get("id") for row in read_jsonl(path)] != job.get("entry_ids"):
+            parser.error(f"approved file does not exactly cover job: {job['job_id']}")
     for path in files:
         for item in read_jsonl(path):
             entry_id = item.get("id")
@@ -84,10 +100,9 @@ def main() -> int:
 
     output = args.output_jsonl.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8", newline="\n") as stream:
-        for entry_id in source_ids:
-            if entry_id in translations:
-                stream.write(json.dumps(translations[entry_id], ensure_ascii=False) + "\n")
+    if output == source_path or output in files:
+        parser.error("merged output must not overwrite an input")
+    atomic_text(output, "".join(json.dumps(translations[entry_id], ensure_ascii=False, separators=(",", ":")) + "\n" for entry_id in source_ids if entry_id in translations))
     print(
         json.dumps(
             {

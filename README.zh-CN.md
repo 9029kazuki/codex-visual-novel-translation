@@ -10,7 +10,7 @@
 
 | Skill | 用途 | 状态 |
 | --- | --- | --- |
-| [`translate-galgame-zh`](skills/translate-galgame-zh) | 日语视觉小说 → 简体中文 | 已发布 |
+| [`translate-galgame-zh`](skills/translate-galgame-zh) | 日语视觉小说 → 简体中文 | 修订 3 |
 | [`translate-visual-novel`](skills/translate-visual-novel) | 英文说明，可配置语言对 | 已发布 |
 
 ## 主要能力
@@ -24,6 +24,22 @@
 - 字形静态覆盖与引擎运行时字体链诊断。
 - 回填、封包、实机测试和补丁复现证据。
 - 从工作区文件恢复中断任务，不依赖聊天记忆。
+
+## 日译中版修订 3
+
+修订 3 加入输入与输出预算、不可变任务快照、按语义依赖定向返工、逐请求缓存统计、独立审校声明和清单驱动的合并。批量建包共享原文解析，减少重复读取。本轮修改针对日译中版；国际版保持独立实现。
+
+已通过 24 项回归测试，以及一个 9 条原文的独立审校与合并试跑。同任务的本地建包样本耗时从 3.06 秒降至 1.76 秒；这是单次局部测量，不代表整部游戏翻译速度。此次未测得真实模型缓存命中，也未对修订 3 进行真实游戏发布验收。
+
+- [修复内容与测量记录](docs/revision-3.zh-CN.md)
+- [交互式流程演示](docs/demo.html)：下载 HTML 文件后在浏览器打开，无需服务器。
+- [旧项目迁移说明](skills/translate-galgame-zh/references/performance-and-migration.md)：继续工作前重建旧任务包并核对已有审校证据。
+
+在仓库根目录运行回归测试：
+
+```text
+python -B -X utf8 skills/translate-galgame-zh/scripts/tests/test_pipeline.py
+```
 
 ## 安装
 

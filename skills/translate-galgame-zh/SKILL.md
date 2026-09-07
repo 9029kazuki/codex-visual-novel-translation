@@ -1,81 +1,58 @@
 ---
 name: translate-galgame-zh
-description: "将日语 Galgame、视觉小说及 Ren'Py/KiriKiri 等文字冒险游戏端到端翻译为简体中文。用于需要研究解包与封包方法，建立术语、人设、世界观、路线知识和角色口吻，提取脚本，按完整场景协作日译中，独立审校、无损回填、修复字体、重新封包、实机测试并制作汉化补丁的任务；也用于恢复或审计中断的汉化项目。"
+description: "将日语 Galgame、视觉小说和 Ren'Py/KiriKiri 等文字冒险游戏翻译为简体中文，支持可恢复的研究与解封包、场景级协作翻译、独立审校、回填、实机验证和补丁交付；也用于恢复、局部修订或审计已有汉化项目。"
 ---
 
 # Galgame 本地化流水线
 
-## 核心原则
+主智能体维护权威资料、批准任务边界、裁决术语、合并与交付；研究、翻译和独立审校可由原生子智能体执行。不要调用外部翻译 API。原始游戏目录只读，所有生成物写入独立工作区。项目事实、快照、任务与验证记录以文件为准。
 
-把主智能体作为唯一协调者和最终裁决者。让主智能体负责研究汇总、项目状态、权威资料、文本提取、任务划分、冲突裁决、合并、封包和交付。不要把这些责任整体移交给子智能体。
+## 按请求选择入口
 
-把整个项目状态写入工作区，不依赖聊天记忆。把原始游戏目录视为只读；所有操作均在独立 staging、build 和 release 目录完成。
+- **完整新汉化**：建立准确游戏版本和文件清单，依次完成研究、无翻译往返、提取、校准资料库、场景任务、翻译与审校、回填封包、实机验证、补丁交付。
+- **恢复或局部修订**：先审计状态和依赖，复用仍有效的证据与批准稿；只重做受影响部分。不要因全局版本数字变化就重译所有任务。
+- **只读审计或文本建议**：按请求检查材料、报告范围。未完成实际封包和实机验证时，不宣称补丁可交付。
 
-不要调用外部翻译 API。优先使用当前 Codex 会话原生的子智能体机制；不可用时按同一任务表由主智能体顺序执行。
+文中的“批准”通常指主协调者作出的项目判断，不额外要求用户逐阶段确认。用户已明确的范围与选择优先。
 
-## 启动或恢复项目
+## 必须保持的约束
 
-1. 确认游戏目录、准确版本、目标语言、工作目录和期望补丁形式。
-2. 新项目运行 `scripts/init_project.py`。已有项目先读取 `run-state.json`、`planning/jobs.jsonl` 和最近的 QA 报告，从最后一个未通过的阶段恢复。
-3. 运行 `scripts/build_manifest.py` 为原始文件建立 SHA-256 清单。
-4. 完整阅读 [workflow-and-state.md](references/workflow-and-state.md)，按阶段门禁推进。
-5. 每次事实、术语、Prompt 或脚本结构发生变化时，记录版本并标记受影响任务；不要静默覆盖既有决策。
+1. 完整补丁在正式全量翻译前，证明目标版本的解包→提取→无修改回填→封包→启动链路。
+2. 所有原文单元有稳定 ID、原文/结构摘要、说话人、路线、场景和受保护标记；只按 ID 回填。
+3. 按完整场景建立 job，分批只改变执行粒度。每个 ID 恰好属于一个 primary chunk，重叠原文只读。
+4. 冻结事实、口吻、称谓、知识门、译例和生效决策。模型资料保留所需语义，来源与检索记录留在权威库；待批准提案不进入生效前缀。
+5. 每个任务绑定自己的不可变前缀、依赖闭包和上下文。新旧批次可并存；依赖真正变化才定向重审。
+6. 根据完整序列化请求和输出预留分批。脚本的 token 计数默认是保守规划估算，不能代替宿主实际窗口、工具返回上限和 usage。
+7. 翻译与审校分别执行；独立审校覆盖完整场景，只输出需修订行和明确的覆盖声明。物化脚本不能替审校者制造“审校通过”。
+8. 子智能体只写自己的任务产物。共享资料、任务表和最终脚本由主智能体单独写入；预留审校容量，避免大量草稿积压。
 
-## 强制流水线
+## 按角色和阶段读取
 
-严格按以下顺序执行，不因用户直接要求翻译而跳过研究、往返测试或验证：
+- 主协调者启动或恢复：读 [workflow-and-state.md](references/workflow-and-state.md)。已有项目升级、预算和性能诊断另读 [performance-and-migration.md](references/performance-and-migration.md)。
+- 研究：读 [community-research.md](references/community-research.md)。技术与作品事实不限语言，中文惯例研究聚焦目标中文语域；复用已核验的准确版本证据。
+- 解包、提取、回填、封包：读 [extraction-and-repacking.md](references/extraction-and-repacking.md)。使用 GARbro 时运行 `scripts/locate_garbro.ps1` 定位用户已安装的版本，可传 `-Path` 或设置 `GARBRO_PATH`；需要交互时加 `-Launch`。
+- 字体替换、缺字或发布验证：读 [font-runtime.md](references/font-runtime.md)，分别验证字形覆盖和运行时实际字体选择。
+- 翻译执行者：读或继承 [translation-contract.md](references/translation-contract.md)，无需重复加载协调、研究与发布手册。
+- 派发与种子管理：主协调者读 [subagent-orchestration.md](references/subagent-orchestration.md) 和 [shared-prefix-and-batching.md](references/shared-prefix-and-batching.md)。不要把长期主对话完整继承给正式工作者。
+- 独立审校、批准、全局 QA 与发布：读 [qa-and-release.md](references/qa-and-release.md)。
 
-1. 登记版本并建立原始文件清单。
-2. 搜索特定游戏和特定版本的解包、提取、回填及封包经验。
-3. 识别引擎，在副本上完成无翻译往返测试。
-4. 无损提取脚本并生成稳定 ID、原文哈希、说话人、路线、场景和控制符元数据。
-5. 不限语言搜索并交叉验证引擎技术、世界观、人设、关系、知识状态和角色口吻；按“原始证据→官方资料→高质量二手资料”而非语种排序。
-6. 只在简体中文译名、汉化惯例和中文玩家接受度的裁定上聚焦中文资料，确定作品名、人名、地名、组织名、招式名、专有词和称谓译法。
-7. 先翻译一个代表性场景作为校准样本，审定后冻结第一版资料库。
-8. 审阅 `scripts/plan_jobs.py` 生成的任务建议，再按实际上下文依赖调整任务边界。
-9. 为每个独立任务准备完整场景上下文，使用子智能体翻译和另一名子智能体审校。
-10. 主智能体解决术语提案和冲突，合并批准译文，运行自动 QA。
-11. 回填、重新封包、启动验证、路线游玩和补丁制作。
+## 工具入口
 
-## 按阶段读取参考资料
+- `init_project.py`、`build_manifest.py`：初始化与源文件清单；保留已有项目。
+- `audit_project.py`、`set_stage.py`：检查阶段证据并逐级推进；不能靠修改 passed 或阶段字符串绕过错误。
+- `plan_jobs.py`：生成新的任务建议文件，主智能体校核上下文依赖后批准。已有非空计划不会被覆盖。
+- `build_shared_prefix.py`：编译稳定的生效资料快照；完整资料是默认，`--profile` 可使用经过主协调者批准的依赖闭包。
+- `build_context_bundle.py`：单任务或 `--jobs …` / `--all-pending` 批量建包，共享一次输入快照。输出 `contexts/<job>/current.json` 指向不可变任务包。
+- `emit_chunk.py`：校验后仅输出一个分批的模型 packet，避免把全部原文或 coverage ID 清单反复读入模型。
+- `audit_dependencies.py`：只读列出可复用与需处理任务，不自动修改状态。
+- `record_cache_probe.py`：记录逐请求缓存读写和 token。只有完整渲染边界与请求身份明确时才评估边界覆盖；未知值不伪装成零。
+- `validate_translation.py`：检查草稿或批准稿的 ID、控制符、换行、术语和异常文本。
+- `create_review_report.py`：记录独立审校者完成阅读后的明确声明；脚本本身不执行语义审校。
+- `apply_review_delta.py`：核验已有独立声明后生成批准稿和单独的物化收据，保留原审校声明。
+- `set_job_status.py`：执行合法状态迁移；`--also-job` 可批量提交相同迁移，失效返工须记录原因。
+- `merge_jobs.py --jobs-jsonl …`：只合并任务表列出的批准稿，并核验物化收据，忽略历史备份。
+- `audit_font_coverage.py`：检查最终显示文本和发布字体；不能替代实机字体报告。
 
-- 开始或恢复项目：读取 [workflow-and-state.md](references/workflow-and-state.md)。
-- 联网研究：读取 [community-research.md](references/community-research.md)。引擎与作品事实研究不限语言；只有目标中文译名与汉化惯例线限定中文资料。保存可访问链接与具体结论。
-- 解包、文本提取或封包：读取 [extraction-and-repacking.md](references/extraction-and-repacking.md)。
-- 新增或替换字体，或出现缺字、方框、错误字体回退及“静态覆盖通过但实机仍缺字”时：完整读取 [font-runtime.md](references/font-runtime.md)。分别证明目标字库包含所需字形，以及引擎运行时实际选择了该字体。
-- 准备 Prompt 或翻译：完整读取 [translation-contract.md](references/translation-contract.md)。
-- 划分任务或委派：完整读取 [subagent-orchestration.md](references/subagent-orchestration.md) 和 [shared-prefix-and-batching.md](references/shared-prefix-and-batching.md)。
-- 审校、合并、实机测试或发布：读取 [qa-and-release.md](references/qa-and-release.md)。
+## 完成交付
 
-## 使用子智能体
-
-当当前环境提供子智能体时，明确请求并使用它们，而不是只在主对话中模拟角色：
-
-- 研究阶段优先并行委派“多语言官方设定与口吻”“目标中文汉化惯例与术语”“多语言引擎及解包经验”三条独立证据线。
-- 长对话中不要让正式翻译/审校子智能体直接继承主任务全部历史。先以无历史继承方式建立“干净种子”，按固定顺序读入完整共享前缀；再由种子派发同一批正式任务并继承种子历史。
-- 共享前缀必须完整包含翻译契约、世界观、全部人设、全部口吻、术语、称谓、知识门、批准译例和当前冻结决策；对每个正式任务的可变内容只附任务契约、场景原文、相邻原文和输出路径。
-- 翻译阶段优先为每个独立完整场景任务启动一个新的子智能体。合并零碎连续脚本，超大任务按自然子场景生成分批计划，并为每个 ID 指定唯一 primary 分批；场景依赖性高于文件边界。
-- 不因“上下文包总字符数”超过人为阈值而阻断任务。使用稳定的精简模型视图和 chunk plan 分批读取；重叠行只用于理解，不得重复输出。
-- 每个子智能体只写自己的任务目录，不允许多个智能体编辑同一文件，也不允许直接修改最终游戏脚本。
-- 预留主智能体和审校容量，分批派发；逐批收集、立即校验，不要等所有翻译结束后才发现格式错误。
-- 子智能体不可用时记录降级原因，由主智能体逐任务执行，不改变输出协议。
-
-## 使用内置工具
-
-- 运行 `scripts/locate_garbro.ps1` 定位用户已安装的 GARbro；需要人工 GUI 操作时使用 `-Launch`。
-- 运行 `scripts/build_manifest.py` 固化原始文件清单。
-- 运行 `scripts/audit_project.py` 审计当前阶段及证据内容；任何 error 都不得靠手改状态绕过。
-- 运行 `scripts/plan_jobs.py` 生成场景任务建议；必须由主智能体审阅后批准。
-- 在正式批次前运行 `scripts/build_shared_prefix.py` 生成内容寻址、顺序固定的共享翻译前缀，并用其建立干净种子。
-- 宿主能提供 usage 计数时，先派发探针 job，再用 `scripts/record_cache_probe.py` 把共享前缀边界、缓存/非缓存输入和最佳努力验证结果写入 `qa/cache/`。
-- 运行 `scripts/build_context_bundle.py` 为子智能体生成任务级精简模型视图、机器清单、分批计划、覆盖证明和必要相邻原文。
-- 运行 `scripts/set_job_status.py` 原子更新任务状态。
-- 运行 `scripts/set_stage.py` 携带证据逐级推进项目阶段，禁止跳过门禁。
-- 每个任务完成后运行 `scripts/validate_translation.py`；有错误时只返工相关任务。
-- 独立审校默认只写需修订的稀疏 delta；运行 `scripts/apply_review_delta.py` 验证全条目覆盖声明、原文/草稿摘要和控制符，再由主智能体物化批准稿。
-- 回填后运行 `scripts/audit_font_coverage.py`，用最终显示文本和实际随补丁发布的字体生成 `qa/font-coverage.json`。该脚本只证明静态字形覆盖，不能替代运行时字体链和实机显示验证。
-- 全部批准后运行 `scripts/merge_jobs.py`，再做全局 QA、回填和封包。
-
-## 完成标准
-
-只有以下条件全部满足才宣布完成：研究资料有来源、无翻译往返测试通过、原文全部有稳定 ID、全部翻译任务已批准、自动 QA 无错误、封包成功、字体静态覆盖与运行时选择链均有证据、游戏可启动、关键路线和选择肢已实机验证、补丁内容与校验和已记录。交付时报告未覆盖路线、残留警告和复现步骤。
+完整汉化补丁只有在目标 ID 覆盖、独立审校、自动 QA、封包、字体静态/实机证据、约定路线与安装测试均通过后才可交付。报告未覆盖路线、残留警告、构建标识和复现方法。演示数据、工具自测和合成场景不能充当真实游戏的发布证据。

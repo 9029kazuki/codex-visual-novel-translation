@@ -13,10 +13,11 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 from audit_project import validate_project
+from pipeline_common import atomic_text, digest_value, json_text, load_semantics, scoped_semantics
 
 
-SCHEMA_VERSION = 1
-SKILL_REVISION = 2
+SCHEMA_VERSION = 2
+SKILL_REVISION = 3
 
 
 def normalize_text(text: str) -> str:
@@ -135,12 +136,15 @@ def main() -> int:
     parser.add_argument("--contract", type=Path)
     parser.add_argument("--decisions", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--profile", type=Path, help="coordinator-approved selected dependency scope; omitted means full project")
     parser.add_argument(
         "--expected-prefix-tokens",
         type=int,
         help="optional observed/externally counted token boundary for cache probes",
     )
     args = parser.parse_args()
+    if args.expected_prefix_tokens is not None and args.expected_prefix_tokens <= 0:
+        parser.error("--expected-prefix-tokens must be positive")
 
     project = args.project_root.resolve()
     gate_issues = validate_project(project, "bible-frozen")
@@ -160,15 +164,15 @@ def main() -> int:
     )
     try:
         decisions_path = choose_decisions(project, args.decisions)
-        decisions_rendered, decisions_digest = render_decisions(decisions_path)
-        contract = read_text(contract_path)
-        world = read_text(project / "bible/world.md")
-        characters = canonical_json_file(project / "bible/characters.json")
-        voice = canonical_json_file(project / "bible/voice.json")
-        honorifics = read_text(project / "bible/honorifics.md")
-        glossary = canonical_tsv_file(project / "bible/glossary.tsv")
-        route_knowledge = canonical_json_file(project / "bible/route-knowledge.json")
-        calibration = canonical_jsonl_file(project / "bible/calibration.jsonl")
+        profile = read_json(args.profile) if args.profile else {"mode": "project"}
+        data = scoped_semantics(load_semantics(project, contract_path, decisions_path), profile)
+        decisions_rendered = fenced("json", json_text(data["decisions"]))
+        decisions_digest = digest_value(data["decisions"])
+        contract, world, honorifics = (data[key] for key in ("contract", "world", "honorifics"))
+        characters, voice = (json_text(data[key]) for key in ("characters", "voice"))
+        glossary = json_text(data["glossary"])
+        route_knowledge = json_text(data["knowledge"])
+        calibration = "".join(json_text(item) for item in data["calibration"])
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -193,7 +197,7 @@ def main() -> int:
             "## 称谓与敬称\n\n"
             + honorifics
             + "\n## 完整术语表\n\n"
-            + fenced("tsv", glossary)
+            + fenced("json", glossary)
             + "\n## 路线知识门\n\n"
             + fenced("json", route_knowledge)
             + "\n## 批准译例\n\n"
@@ -208,10 +212,13 @@ def main() -> int:
     shared_text = normalize_text("\n".join(text.rstrip("\n") for _, text in sections))
     prefix_digest = sha256_text(shared_text)
     prefix_id = prefix_digest.removeprefix("sha256:")[:20]
+    # File identity stays separate from bindings to physical source snapshots.
+    binding = {"profile": profile, "contract": str(contract_path), "decisions": project_relative(project, decisions_path)}
+    binding_id = digest_value(binding).removeprefix("sha256:")[:16]
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
-        else project / "contexts/shared-prefix" / prefix_id
+        else project / "contexts/shared-prefix" / prefix_id / binding_id
     )
 
     section_manifest: list[dict[str, Any]] = []
@@ -232,11 +239,14 @@ def main() -> int:
         "skill_name": "translate-galgame-zh",
         "skill_revision": SKILL_REVISION,
         "prefix_id": prefix_id,
+        "binding_id": binding_id,
         "prefix_sha256": prefix_digest,
         "prefix_chars": len(shared_text),
         "prefix_bytes": len(shared_text.encode("utf-8")),
-        "expected_cached_prefix_tokens": args.expected_prefix_tokens,
-        "bible_version": bible_version,
+        "profile": profile,
+        "contract_source": str(contract_path),
+        "live_decisions_source": project_relative(project, project / "planning/translation-decisions.json") if (project / "planning/translation-decisions.json").is_file() else project_relative(project, project / "research/decisions.md"),
+        "semantic_inputs": {"file": "semantic-inputs.json", "sha256": digest_value(data)},
         "decision_snapshot": {
             "source": project_relative(project, decisions_path),
             "sha256": decisions_digest,
@@ -250,6 +260,7 @@ def main() -> int:
         for name, text in sections:
             write_if_same_or_missing(output_dir / "sections" / name, text)
         write_if_same_or_missing(output_dir / "shared-prefix.md", shared_text)
+        write_if_same_or_missing(output_dir / "semantic-inputs.json", json_text(data))
         write_if_same_or_missing(
             output_dir / "shared-prefix-manifest.json", manifest_text
         )
@@ -266,9 +277,12 @@ def main() -> int:
     }
     current_path = project / "contexts/shared-prefix/current.json"
     current_path.parent.mkdir(parents=True, exist_ok=True)
-    current_path.write_text(
-        canonical_json(current), encoding="utf-8", newline="\n"
-    )
+    atomic_text(current_path, canonical_json(current))
+    if args.expected_prefix_tokens is not None:
+        atomic_text(project / "qa/cache" / f"{prefix_id}.token-observation.json", canonical_json({
+            "prefix_id": prefix_id, "observed_text_tokens": args.expected_prefix_tokens,
+            "cache_verified": False, "bible_version": bible_version,
+        }))
 
     print(
         json.dumps(

@@ -10,7 +10,7 @@ This repository contains installable Codex skills rather than a runtime translat
 
 | Skill | Purpose | Status |
 | --- | --- | --- |
-| [`translate-galgame-zh`](skills/translate-galgame-zh) | Japanese visual novel → Simplified Chinese | Available |
+| [`translate-galgame-zh`](skills/translate-galgame-zh) | Japanese visual novel → Simplified Chinese | Revision 3 |
 | [`translate-visual-novel`](skills/translate-visual-novel) | Configurable source and target languages, English instructions | Available |
 
 ## What the workflow covers
@@ -24,6 +24,22 @@ This repository contains installable Codex skills rather than a runtime translat
 - Font coverage and runtime font-chain diagnosis.
 - Repacking, playtesting, and reproducible patch evidence.
 - Resuming interrupted projects from files instead of chat memory.
+
+## Revision 3: Japanese-to-Simplified-Chinese edition
+
+Revision 3 adds input and output planning budgets, immutable job snapshots, scoped dependency checks, per-request cache accounting, independent review declarations, and merges driven by the approved job manifest. Batch preparation shares source parsing across jobs. The multilingual edition has a separate implementation and is not part of this update.
+
+The revision passed 24 regression tests and an independent nine-line synthetic review/merge exercise. A matched local preparation benchmark took 3.06 seconds before the change and 1.76 seconds after it; this is a single local sample, not an end-to-end translation speedup. Actual model cache hits and real-game release validation were not measured in this exercise.
+
+- [Revision details and measurements (Chinese)](docs/revision-3.zh-CN.md)
+- [Interactive workflow demonstration](docs/demo.html): download the HTML file and open it in a browser; no server is required.
+- [Migration notes for existing projects (Chinese)](skills/translate-galgame-zh/references/performance-and-migration.md): rebuild legacy bundles and verify existing review evidence before resuming.
+
+Run the self-contained regression suite from the repository root:
+
+```text
+python -B -X utf8 skills/translate-galgame-zh/scripts/tests/test_pipeline.py
+```
 
 ## Install
 

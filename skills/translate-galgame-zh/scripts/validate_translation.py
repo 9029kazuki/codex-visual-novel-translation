@@ -10,6 +10,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+from pipeline_common import atomic_text, digest_text, read_text
 
 
 JAPANESE_KANA = re.compile(r"[\u3041-\u3096\u30a1-\u30fa]")
@@ -83,6 +84,7 @@ def glossary_row_is_shadowed(
     source_term = (row.get("source") or "").strip()
     if not source_term:
         return False
+    covering_spans = []
     for other in applicable_rows:
         longer_source = (other.get("source") or "").strip()
         longer_target = (other.get("target") or "").strip()
@@ -93,8 +95,18 @@ def glossary_row_is_shadowed(
             and longer_target
             and longer_target in translation
         ):
-            return True
-    return False
+            start = source_text.find(longer_source)
+            while start >= 0:
+                covering_spans.append((start, start + len(longer_source)))
+                start = source_text.find(longer_source, start + 1)
+    start = source_text.find(source_term)
+    if start < 0:
+        return False
+    while start >= 0:
+        if not any(left <= start and start + len(source_term) <= right for left, right in covering_spans):
+            return False
+        start = source_text.find(source_term, start + 1)
+    return True
 
 
 def main() -> int:
@@ -177,7 +189,11 @@ def main() -> int:
         add_issue(issues, "error", "id-order", "translation ids are not in source order")
 
     glossary = read_glossary(args.glossary.resolve() if args.glossary else None)
-    same_source_translations: dict[str, set[str]] = defaultdict(set)
+    scope_index = defaultdict(list)
+    for row in glossary:
+        scope_index[(row.get("scope") or "global").strip() or "global"].append(row)
+    matcher_cache = {}
+    same_source_translations = defaultdict(set)
     for entry_id in expected_order:
         source = source_by_id[entry_id]
         target = target_by_id[entry_id]
@@ -186,7 +202,8 @@ def main() -> int:
             add_issue(issues, "error", "empty-translation", "translation is empty", entry_id)
             continue
         source_text = str(source.get("text") or "")
-        same_source_translations[source_text].add(translation)
+        reuse_scope = source.get("reuse_group") or (source.get("speaker"), source.get("route"), source.get("scene_id"))
+        same_source_translations[(source_text, str(reuse_scope))].add(translation)
 
         expected_hash = source.get("source_hash")
         if (
@@ -280,7 +297,7 @@ def main() -> int:
                     entry_id,
                 )
         confidence = target.get("confidence")
-        if confidence not in CONFIDENCE_VALUES:
+        if "confidence" in target and confidence not in CONFIDENCE_VALUES:
             add_issue(
                 issues,
                 "warning",
@@ -298,8 +315,23 @@ def main() -> int:
                     entry_id,
                 )
 
-        applicable_glossary = [row for row in glossary if scope_applies(row, source)]
-        for row in applicable_glossary:
+        scopes = tuple(sorted({"global", str(source.get("route") or ""), str(source.get("scene_id") or ""), str(source.get("speaker") or "")} & set(scope_index)))
+        if scopes not in matcher_cache:
+            rows = [row for scope in scopes for row in scope_index[scope]]
+            terms = sorted({row.get("source", "").strip() for row in rows if row.get("source", "").strip()}, key=lambda x: (-len(x), x))
+            matcher = re.compile("(?=(" + "|".join(re.escape(x) for x in terms) + "))") if terms else None
+            by_term = defaultdict(list)
+            forbidden = []
+            for row in rows:
+                by_term[row.get("source", "").strip()].append(row)
+                if row.get("status") == "forbidden":
+                    forbidden.append(row)
+            matcher_cache[scopes] = (by_term, forbidden, matcher)
+        by_term, forbidden, matcher = matcher_cache[scopes]
+        matched = {match.group(1) for match in matcher.finditer(source_text)} if matcher else set()
+        candidate_rows = [row for term in sorted(matched) for row in by_term[term]]
+        candidate_rows += [row for row in forbidden if row.get("source", "").strip() not in matched]
+        for row in candidate_rows:
             term_source = (row.get("source") or "").strip()
             term_target = (row.get("target") or "").strip()
             status = (row.get("status") or "").strip().lower()
@@ -316,7 +348,7 @@ def main() -> int:
                 and term_source in source_text
                 and term_target
                 and not glossary_row_is_shadowed(
-                    row, applicable_glossary, source_text, translation
+                    row, candidate_rows, source_text, translation
                 )
             ):
                 if status == "locked" and term_target not in translation:
@@ -336,7 +368,7 @@ def main() -> int:
                         entry_id,
                     )
 
-    for source_text, translations in same_source_translations.items():
+    for (source_text, reuse_scope), translations in same_source_translations.items():
         if source_text and len(translations) > 1 and SEMANTIC_TEXT.search(source_text):
             add_issue(
                 issues,
@@ -348,9 +380,11 @@ def main() -> int:
     errors = sum(issue["severity"] == "error" for issue in issues)
     warnings = sum(issue["severity"] == "warning" for issue in issues)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source": str(source_path),
         "translation": str(translation_path),
+        "allow_subset": args.allow_subset,
+        "input_digests": {str(path): digest_text(read_text(path)) for path in [source_path, translation_path, *([args.glossary.resolve()] if args.glossary else [])]},
         "source_records": len(sources),
         "translation_records": len(targets),
         "source_hash_policy": "reconstructed; provided values must match",
@@ -359,11 +393,9 @@ def main() -> int:
         "issues": issues,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    if report_path in {source_path, translation_path, args.glossary.resolve() if args.glossary else None}:
+        parser.error("QA report must not overwrite an input")
+    atomic_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(
         json.dumps(
             {"report": str(report_path), "errors": errors, "warnings": warnings},

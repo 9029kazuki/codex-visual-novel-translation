@@ -9,6 +9,7 @@ import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from pipeline_common import atomic_text, digest_text, digest_value
 
 
 ALLOWED_DELTA_FIELDS = {"id", "reviewer_translation", "reason", "severity"}
@@ -111,6 +112,21 @@ def validate_translation_shape(
         raise ValueError(f"{label} for {source.get('id')} contains U+FFFD or NUL")
 
 
+def validate_delta(source: dict[str, Any], delta: dict[str, Any]) -> None:
+    entry_id = delta.get("id")
+    fields = set(without_internal(delta))
+    if fields != ALLOWED_DELTA_FIELDS:
+        raise ValueError(f"review delta {entry_id} fields must be exactly {sorted(ALLOWED_DELTA_FIELDS)}, found {sorted(fields)}")
+    text = delta.get("reviewer_translation")
+    if not isinstance(text, str):
+        raise ValueError(f"review delta {entry_id} needs reviewer_translation")
+    if not isinstance(delta.get("reason"), str) or not delta["reason"].strip():
+        raise ValueError(f"review delta {entry_id} needs a reason")
+    if delta.get("severity") not in SEVERITIES:
+        raise ValueError(f"review delta {entry_id} severity must be minor or major")
+    validate_translation_shape(source, text, "reviewer translation")
+
+
 def load_existing_report(path: Path | None) -> dict[str, Any] | None:
     if path is None or not path.exists():
         return None
@@ -134,7 +150,7 @@ def main() -> int:
     parser.add_argument(
         "--verify-existing-report",
         action="store_true",
-        help="fail instead of replacing the report when its frozen digests differ",
+        help="compatibility flag; an existing matching independent declaration is always required and never overwritten",
     )
     args = parser.parse_args()
 
@@ -180,25 +196,7 @@ def main() -> int:
             validate_translation_shape(source, draft_translation, "draft translation")
 
         for entry_id in delta_order:
-            delta = delta_by_id[entry_id]
-            fields = set(without_internal(delta))
-            if fields != ALLOWED_DELTA_FIELDS:
-                raise ValueError(
-                    f"review delta {entry_id} fields must be exactly "
-                    f"{sorted(ALLOWED_DELTA_FIELDS)}, found {sorted(fields)}"
-                )
-            reviewer_translation = delta.get("reviewer_translation")
-            if not isinstance(reviewer_translation, str):
-                raise ValueError(f"review delta {entry_id} needs reviewer_translation")
-            if not isinstance(delta.get("reason"), str) or not delta["reason"].strip():
-                raise ValueError(f"review delta {entry_id} needs a reason")
-            if delta.get("severity") not in SEVERITIES:
-                raise ValueError(
-                    f"review delta {entry_id} severity must be minor or major"
-                )
-            validate_translation_shape(
-                source_by_id[entry_id], reviewer_translation, "reviewer translation"
-            )
+            validate_delta(source_by_id[entry_id], delta_by_id[entry_id])
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -222,7 +220,15 @@ def main() -> int:
         existing_report = load_existing_report(report_path)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    if args.verify_existing_report and existing_report is not None:
+    if existing_report is None:
+        parser.error("independent review declaration is required; materialization cannot create it")
+    if existing_report.get("passed") is not True:
+        parser.error("independent review has unresolved issues or did not pass")
+    reviewer = existing_report.get("reviewer")
+    translator = existing_report.get("translator")
+    if not isinstance(reviewer, str) or not reviewer.strip() or not isinstance(translator, str) or not translator.strip() or reviewer == translator:
+        parser.error("review declaration requires distinct nonempty reviewer and translator identities")
+    if existing_report is not None:
         frozen_fields = (
             "job_id",
             "reviewed_source_digest",
@@ -240,27 +246,28 @@ def main() -> int:
         if mismatches:
             parser.error(f"existing review report is stale: {mismatches}")
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    report["verified_review_report_digest"] = digest_text(report_path.read_text(encoding="utf-8-sig"))
+    report["reviewer"], report["translator"] = reviewer, translator
 
     approved_output = args.approved_output.resolve() if args.approved_output else None
     if approved_output is not None:
         approved_output.parent.mkdir(parents=True, exist_ok=True)
-        with approved_output.open("w", encoding="utf-8", newline="\n") as stream:
-            for entry_id in source_order:
-                approved = without_internal(dict(draft_by_id[entry_id]))
-                if entry_id in delta_by_id:
-                    approved["translation"] = delta_by_id[entry_id][
-                        "reviewer_translation"
-                    ]
-                expected_hash = source_by_id[entry_id].get("source_hash")
-                if expected_hash:
-                    approved["source_hash"] = expected_hash
-                stream.write(json.dumps(approved, ensure_ascii=False) + "\n")
+        approved_rows = []
+        for entry_id in source_order:
+            approved = without_internal(dict(draft_by_id[entry_id]))
+            if entry_id in delta_by_id:
+                approved["translation"] = delta_by_id[entry_id]["reviewer_translation"]
+            expected_hash = source_by_id[entry_id].get("source_hash")
+            if expected_hash:
+                approved["source_hash"] = expected_hash
+            approved_rows.append(approved)
+        approved_text = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in approved_rows)
+        if approved_output in {source_path, draft_path, delta_path, report_path}:
+            parser.error("approved output must not overwrite source, draft, delta, or review declaration")
+        atomic_text(approved_output, approved_text)
+        report["approved_digest"] = digest_text(approved_text)
+    materialization_path = report_path.with_suffix(".materialization.json")
+    atomic_text(materialization_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
     print(
         json.dumps(

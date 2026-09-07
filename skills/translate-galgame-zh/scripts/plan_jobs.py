@@ -10,6 +10,7 @@ import math
 import re
 from pathlib import Path
 from typing import Any, Iterable
+from pipeline_common import decisions_view, digest_value, read_json, TokenCounter, json_text
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -111,26 +112,13 @@ def source_digest(records: list[dict[str, Any]]) -> str:
 
 
 def decision_snapshot_digest(path: Path) -> str:
-    suffix = path.suffix.casefold()
-    if suffix == ".json":
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-        text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    elif suffix == ".jsonl":
-        lines: list[str] = []
-        with path.open("r", encoding="utf-8-sig") as stream:
-            for line_number, raw in enumerate(stream, 1):
-                if not raw.strip():
-                    continue
-                try:
-                    value = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
-                lines.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        text = "\n".join(lines) + ("\n" if lines else "")
+    if path.suffix.lower() == ".json":
+        value = read_json(path)
+    elif path.suffix.lower() == ".jsonl":
+        value = [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
     else:
-        text = path.read_text(encoding="utf-8-sig")
-        text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        value = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+    return digest_value(decisions_view(value))
 
 
 def main() -> int:
@@ -150,7 +138,11 @@ def main() -> int:
         type=Path,
         help="frozen JSON/JSONL/Markdown decision snapshot for this cohort",
     )
+    parser.add_argument("--encoding", help="optional tiktoken encoding for a labeled proxy estimate")
     args = parser.parse_args()
+    if args.output_jsonl.exists() and args.output_jsonl.stat().st_size:
+        parser.error("planning output already contains work; write a new proposed plan and explicitly migrate accepted jobs")
+    counter = TokenCounter(args.encoding)
 
     records = read_jsonl(args.source_jsonl.resolve())
     decision_path = args.decision_snapshot.resolve() if args.decision_snapshot else None
@@ -177,8 +169,8 @@ def main() -> int:
             route = str(first.get("route") or "unassigned")
             char_count = sum(len(item["text"]) for item in records_in_job)
             index = len(jobs) + 1
-            part_suffix = f"-p{len([j for j in jobs if j['scene_ids'] == scene_ids]) + 1}" if part_count > 1 else ""
-            job_id = f"job-{index:05d}-{slug(scene_ids[0])}{part_suffix}"
+            identity = digest_value([route, scene_ids, [item["id"] for item in records_in_job]]).split(":")[1][:16]
+            job_id = f"job-{slug(scene_ids[0])}-{identity}"
             missing_scene = any(not item.get("scene_id") for item in records_in_job)
             speakers = sorted(
                 {
@@ -199,7 +191,9 @@ def main() -> int:
                     "entry_ids": [item["id"] for item in records_in_job],
                     "speakers": speakers,
                     "source_char_count": char_count,
-                    "estimated_source_tokens": math.ceil(char_count * 1.15),
+                    "estimated_model_input_tokens": counter.count("".join(json_text({key: item.get(key) for key in ("id", "kind", "speaker", "text", "protected_tokens")}) for item in records_in_job)),
+                    "token_estimate_method": counter.method,
+                    "dependency_scope": {"mode": "project"},
                     "source_digest": source_digest(records_in_job),
                     "bible_version": args.bible_version,
                     "decision_snapshot": str(decision_path) if decision_path else None,

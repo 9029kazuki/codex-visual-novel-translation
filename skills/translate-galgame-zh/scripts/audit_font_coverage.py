@@ -511,6 +511,7 @@ def main() -> int:
     parser.add_argument("--encoding")
     parser.add_argument("--keep-protected-tokens", action="store_true")
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--build-digest", help="bind a final static audit to the repacked build; required by the release gate")
     args = parser.parse_args()
 
     errors: list[str] = []
@@ -576,6 +577,7 @@ def main() -> int:
     passed = not errors and not missing and not missing_probes
     report = {
         "schema_version": 1,
+        "build_digest": args.build_digest,
         "passed": passed,
         "static_only": True,
         "runtime_tested": False,
